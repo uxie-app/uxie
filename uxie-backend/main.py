@@ -72,14 +72,20 @@ async def lifespan(app: FastAPI):
     import scheduled_tasks as _sched
     cron_task = __import__("asyncio").create_task(_sched.cron_worker())
 
+    # Durable background-task worker. Leases queued tasks and resumes ones
+    # whose worker died (task_runtime.py).
+    import task_runtime as _runtime
+    task_worker = __import__("asyncio").create_task(_runtime.worker_loop())
+
     try:
         yield
     finally:
-        cron_task.cancel()
-        try:
-            await cron_task
-        except Exception:
-            pass
+        for bg in (cron_task, task_worker):
+            bg.cancel()
+            try:
+                await bg
+            except BaseException:
+                pass
         await proxy.close_http()
 
 
@@ -289,6 +295,7 @@ app.add_api_route("/user/connector_token/{provider}", _connector_token, methods=
 import tasks as _tasks  # noqa: E402
 app.add_api_route("/tasks/create",      _tasks.tasks_create, methods=["POST"])
 app.add_api_route("/tasks",             _tasks.tasks_list,   methods=["GET"])
+app.add_api_route("/tasks/stream",      _tasks.tasks_stream, methods=["GET"])  # before /tasks/{task_id}
 app.add_api_route("/tasks/{task_id}",   _tasks.tasks_get,    methods=["GET"])
 app.add_api_route("/tasks/{task_id}/cancel", _tasks.tasks_cancel, methods=["POST"])
 app.add_api_route("/tasks/{task_id}/approve", _tasks.tasks_approve, methods=["POST"])

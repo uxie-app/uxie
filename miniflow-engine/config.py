@@ -378,8 +378,17 @@ def get_uxie_backend_url() -> str:
     return url.rstrip("/")
 
 
+# The JWT lives in Electron's safeStorage (OS keychain / DPAPI) when
+# available. Electron hands it to us at connect time via set_session_token
+# and we keep it in memory only. Right after login (or on first run after
+# upgrading) it's still in uxie_auth.json until Electron adopts it with
+# take_file_token, which strips it from the file.
+_session_token: str | None = None
+_token_in_secure_store = False
+
+
 def get_jwt() -> str | None:
-    return _read_json(_UXIE_AUTH_FILE, {}).get("access_token") or None
+    return _session_token or _read_json(_UXIE_AUTH_FILE, {}).get("access_token") or None
 
 
 def save_jwt(
@@ -389,21 +398,58 @@ def save_jwt(
     referral_code: str = "",
     free_days_remaining: int = 30,
 ):
+    global _session_token
+    _session_token = token
     _ensure_dir()
     data = _read_json(_UXIE_AUTH_FILE, {})
     data.update({
-        "access_token": token,
         "email": email,
         "tier": tier,
         "referral_code": referral_code,
         "free_days_remaining": free_days_remaining,
     })
+    if _token_in_secure_store:
+        data.pop("access_token", None)
+    else:
+        data["access_token"] = token
     _write_json(_UXIE_AUTH_FILE, data)
 
 
+def set_session_token(token: str) -> dict:
+    """Electron decrypted the token from safeStorage — hold it in memory."""
+    global _session_token, _token_in_secure_store
+    _session_token = token or None
+    _token_in_secure_store = bool(token)
+    return {"ok": True}
+
+
+def take_file_token() -> dict:
+    """Hand the on-disk token to Electron for secure storage and remove it
+    from the file. Returns {"token": None} if there's nothing to adopt."""
+    global _session_token, _token_in_secure_store
+    data = _read_json(_UXIE_AUTH_FILE, {})
+    token = data.pop("access_token", None)
+    if not token:
+        return {"token": None}
+    _write_json(_UXIE_AUTH_FILE, data)
+    _session_token = token
+    _token_in_secure_store = True
+    return {"token": token}
+
+
 def clear_jwt():
+    global _session_token, _token_in_secure_store
+    _session_token = None
+    _token_in_secure_store = False
     _write_json(_UXIE_AUTH_FILE, {})
 
 
 def get_uxie_user() -> dict:
-    return _read_json(_UXIE_AUTH_FILE, {})
+    """Profile for the UI. The token itself is never returned — the UI only
+    checks `access_token` for truthiness to decide signed-in state."""
+    data = _read_json(_UXIE_AUTH_FILE, {})
+    if get_jwt():
+        data["access_token"] = "stored"
+    else:
+        data.pop("access_token", None)
+    return data

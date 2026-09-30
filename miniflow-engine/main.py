@@ -137,6 +137,8 @@ async def lifespan(app: FastAPI):
     meeting_watcher.set_event_emitter(manager.broadcast)
     # Start MCP servers (Playwright always-on + any with saved credentials)
     asyncio.create_task(mcp_client.start())
+    # Relay Railway /tasks/stream → WS "task-update" (notifications + Tasks tab).
+    asyncio.create_task(_relay_task_stream())
     # Warm up litellm in the background so the first real LLM call doesn't
     # pay for module init + cost-map load.
     asyncio.create_task(_warm_litellm())
@@ -525,6 +527,45 @@ async def _get_user_status():
     return data
 
 
+async def _relay_task_stream() -> None:
+    """Hold an SSE connection to Railway /tasks/stream and rebroadcast each
+    `task-update` to Electron. Reconnects forever; idles while signed out."""
+    import httpx
+    backoff = 2
+    while True:
+        jwt = config.get_jwt()
+        if not jwt:
+            await asyncio.sleep(10)
+            continue
+        try:
+            timeout = httpx.Timeout(10, read=60)  # server pings every 15s
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "GET", f"{config.get_uxie_backend_url()}/tasks/stream",
+                    headers={"Authorization": f"Bearer {jwt}"},
+                ) as r:
+                    if r.status_code != 200:
+                        raise httpx.HTTPError(f"status {r.status_code}")
+                    backoff = 2
+                    event = None
+                    async for line in r.aiter_lines():
+                        if line.startswith("event:"):
+                            event = line[6:].strip()
+                        elif line.startswith("data:") and event == "task-update":
+                            try:
+                                await manager.broadcast("task-update", json.loads(line[5:]))
+                            except ValueError:
+                                pass
+                        elif not line:
+                            event = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug(f"task stream disconnected: {e}")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+
 async def _tasks_create(prompt: str) -> dict:
     """Create a background task on Railway. Returns {id, status}."""
     import httpx
@@ -803,6 +844,8 @@ async def invoke(command: str, body: dict = {}):
         "get_user_status":       lambda b: _get_user_status(),
         "logout_uxie":           lambda b: config.clear_jwt(),
         "get_uxie_user":         lambda b: config.get_uxie_user(),
+        "set_session_token":     lambda b: config.set_session_token(b.get("token") or ""),
+        "take_file_token":       lambda b: config.take_file_token(),
         # Approval widget
         "resolve_approval":      lambda b: agent.resolve_approval(
             bool(b.get("approved", False)),

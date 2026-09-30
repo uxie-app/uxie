@@ -14,7 +14,7 @@ import secrets
 import string
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -70,6 +70,7 @@ class OTP(Base):
     code = Column(String(6), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     used = Column(Boolean, nullable=False, default=False)
+    attempts = Column(Integer, nullable=True, default=0)  # wrong guesses; locked at OTP_MAX_ATTEMPTS
 
 
 class Usage(Base):
@@ -157,6 +158,23 @@ async def get_db():
         yield session
 
 
+# create_all never alters existing tables, so columns added to a model after
+# its table exists in prod are listed here. Additive + nullable only, so the
+# previous deploy keeps working during a rolling deploy.
+ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
+    ("otps", "attempts", "INTEGER DEFAULT 0"),
+    ("background_tasks", "lease_owner", "VARCHAR"),
+    ("background_tasks", "lease_expires_at", "TIMESTAMP WITH TIME ZONE"),
+    ("background_tasks", "attempt", "INTEGER DEFAULT 0"),
+    ("background_tasks", "checkpoint", "JSON"),
+]
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if conn.dialect.name == "postgresql":
+            for table, column, ddl in ADDITIVE_COLUMNS:
+                await conn.execute(text(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl}"
+                ))

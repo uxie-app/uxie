@@ -32,17 +32,17 @@ import json
 import logging
 import secrets
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import current_user
 from db import SessionLocal, User, get_db
-from db_ios import BackgroundTask, TaskEvent
+from db_ios import BackgroundTask, TaskApproval, TaskEvent
 from limits import check_and_increment, check_burst
 from proxy import _llm_base_and_key, get_http
 from settings import get_settings
@@ -160,52 +160,58 @@ async def _allowed_tool_schemas(db: AsyncSession, user_id: int) -> list[dict]:
 
 
 # ── Approval gate ────────────────────────────────────────────────────────────
-# Each destructive tool call parks on an asyncio.Event keyed by
-# (task_id, tool_call_id). /tasks/{id}/approve resolves it.
+# Persisted in task_approvals so a pending approval survives a restart and
+# can be resolved from any replica. The task loop polls its row with a
+# short-lived session of its own (the loop's session is shared across the
+# parallel tool calls in a turn, so it can't be used concurrently).
 
-from dataclasses import dataclass, field
-
-
-@dataclass
-class _ApprovalGate:
-    event: asyncio.Event = field(default_factory=asyncio.Event)
-    approved: bool = False
-    edited_args: dict | None = None
+APPROVAL_POLL_S = 2.0
 
 
-_APPROVAL_GATES: dict[tuple[str, str], _ApprovalGate] = {}
-_APPROVAL_LOCK = asyncio.Lock()
+def _aware(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 async def _park_for_approval(
-    task_id: str, tool_call_id: str, timeout_s: float
-) -> tuple[bool, dict | None]:
-    """Block until /tasks/{id}/approve fires for this tool_call. Returns
-    (approved, edited_args_or_None). Times out → (False, None)."""
-    gate = _ApprovalGate()
-    async with _APPROVAL_LOCK:
-        _APPROVAL_GATES[(task_id, tool_call_id)] = gate
-    try:
-        await asyncio.wait_for(gate.event.wait(), timeout=timeout_s)
-        return gate.approved, gate.edited_args
-    except asyncio.TimeoutError:
-        return False, None
-    finally:
-        async with _APPROVAL_LOCK:
-            _APPROVAL_GATES.pop((task_id, tool_call_id), None)
+    task_id: str, tool_call_id: str, tool: str, timeout_s: float,
+) -> tuple[str, dict | None, str | None]:
+    """Wait until the user decides on this tool call. Returns
+    (status, edited_args, stored_result) where status is one of
+    approved | denied | executed | timeout. `executed` means a previous
+    attempt of this task already ran the call — reuse `stored_result`."""
+    while True:
+        async with SessionLocal() as s:
+            row = (await s.execute(select(TaskApproval).where(
+                TaskApproval.task_id == task_id, TaskApproval.tool_call_id == tool_call_id,
+            ))).scalar_one_or_none()
+            if row is None:
+                s.add(TaskApproval(task_id=task_id, tool_call_id=tool_call_id, tool=tool))
+                await s.commit()
+            elif row.status in ("approved", "denied", "executed"):
+                return row.status, row.edited_args, row.result
+            elif datetime.now(timezone.utc) - _aware(row.created_at) > timedelta(seconds=timeout_s):
+                row.status = "denied"
+                row.decided_at = datetime.now(timezone.utc)
+                await s.commit()
+                return "timeout", None, None
+        await asyncio.sleep(APPROVAL_POLL_S)
 
 
-async def _resolve_approval(
-    task_id: str, tool_call_id: str, approved: bool, edited_args: dict | None,
-) -> bool:
-    async with _APPROVAL_LOCK:
-        gate = _APPROVAL_GATES.get((task_id, tool_call_id))
-    if gate is None:
-        return False
-    gate.approved = approved
-    gate.edited_args = edited_args
-    gate.event.set()
-    return True
+async def _mark_executed(task_id: str, tool_call_id: str, result: str) -> None:
+    async with SessionLocal() as s:
+        await s.execute(update(TaskApproval).where(
+            TaskApproval.task_id == task_id, TaskApproval.tool_call_id == tool_call_id,
+        ).values(status="executed", result=result))
+        await s.commit()
+
+
+async def _save_checkpoint(db: AsyncSession, task_id: str, messages: list[dict], turn: int) -> None:
+    """Persist conversation state so a reclaimed task resumes here. Commits."""
+    await db.execute(update(BackgroundTask).where(BackgroundTask.id == task_id).values(
+        checkpoint={"messages": list(messages), "turn": turn},
+        updated_at=datetime.now(timezone.utc),
+    ))
+    await db.commit()
 
 
 # ── Agent loop ────────────────────────────────────────────────────────────────
@@ -299,10 +305,17 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
             })
             await db.commit()
 
-            messages: list[dict] = [
+            # Resume from the last checkpoint if a previous worker died
+            # mid-task (task_runtime reclaims expired leases).
+            row = (await db.execute(
+                select(BackgroundTask).where(BackgroundTask.id == task_id)
+            )).scalar_one_or_none()
+            cp = (row.checkpoint if row is not None else None) or {}
+            messages: list[dict] = cp.get("messages") or [
                 {"role": "system", "content": _build_system_prompt(tool_schemas)},
                 {"role": "user", "content": prompt},
             ]
+            start_turn = int(cp.get("turn") or 0)
 
             base_url, api_key = _llm_base_and_key(DEFAULT_PROVIDER)
             http = get_http()
@@ -310,71 +323,81 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
 
             final_text: str | None = None
 
-            for turn in range(MAX_TASK_TURNS):
+            for turn in range(start_turn, MAX_TASK_TURNS):
                 # Refresh the row at top of every turn so a cancel request
                 # (POST /tasks/{id}/cancel) takes effect on the next iteration.
                 fresh = (await db.execute(
                     select(BackgroundTask).where(BackgroundTask.id == task_id)
+                    .execution_options(populate_existing=True)
                 )).scalar_one_or_none()
                 if fresh is None or fresh.status == "cancelled":
                     await _append_event(db, task_id, "step_start", {"step": "cancelled"})
                     await db.commit()
                     return
 
-                payload: dict[str, Any] = {
-                    "model": DEFAULT_MODEL,
-                    "messages": messages,
-                    "temperature": 0.2,
-                }
-                if tool_schemas:
-                    payload["tools"] = tool_schemas
-                    # Force a tool call on the first turn so GPT-4o doesn't
-                    # bail out with "I can't access your calendar" — even
-                    # when the tool list is in the prompt, the model
-                    # sometimes ignores it under "auto". After the first
-                    # turn we switch to "auto" so the model can synthesize
-                    # a final summary from the tool results.
-                    payload["tool_choice"] = "required" if turn == 0 else "auto"
+                last = messages[-1] if messages else {}
+                if last.get("role") == "assistant" and last.get("tool_calls"):
+                    # Crashed after the LLM asked for tools but before the
+                    # results were saved — re-run those same calls. Destructive
+                    # ones are idempotent via task_approvals.
+                    tool_calls = last["tool_calls"]
+                else:
+                    payload: dict[str, Any] = {
+                        "model": DEFAULT_MODEL,
+                        "messages": messages,
+                        "temperature": 0.2,
+                    }
+                    if tool_schemas:
+                        payload["tools"] = tool_schemas
+                        # Force a tool call on the first turn so GPT-4o doesn't
+                        # bail out with "I can't access your calendar" — even
+                        # when the tool list is in the prompt, the model
+                        # sometimes ignores it under "auto". After the first
+                        # turn we switch to "auto" so the model can synthesize
+                        # a final summary from the tool results.
+                        payload["tool_choice"] = "required" if turn == 0 else "auto"
 
-                resp = await http.post(
-                    f"{base_url}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=90,
-                )
-                if resp.status_code != 200:
-                    text = resp.text[:300]
-                    await _append_event(db, task_id, "error", {"http": resp.status_code, "body": text})
-                    await _update_task_status(
-                        db, task_id, status="failed",
-                        error=f"LLM call failed ({resp.status_code})",
-                        completed=True,
+                    resp = await http.post(
+                        f"{base_url}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                        timeout=90,
                     )
-                    await db.commit()
-                    return
+                    if resp.status_code != 200:
+                        text = resp.text[:300]
+                        await _append_event(db, task_id, "error", {"http": resp.status_code, "body": text})
+                        await _update_task_status(
+                            db, task_id, status="failed",
+                            error=f"LLM call failed ({resp.status_code})",
+                            completed=True,
+                        )
+                        await db.commit()
+                        return
 
-                data = resp.json()
-                choice = (data.get("choices") or [{}])[0]
-                msg = choice.get("message") or {}
-                content = msg.get("content")
-                tool_calls = msg.get("tool_calls") or []
+                    data = resp.json()
+                    choice = (data.get("choices") or [{}])[0]
+                    msg = choice.get("message") or {}
+                    content = msg.get("content")
+                    tool_calls = msg.get("tool_calls") or []
 
-                # Append assistant message verbatim (with tool_calls) so the
-                # next turn can include it in conversation history.
-                assistant_message: dict[str, Any] = {"role": "assistant"}
-                if content is not None:
-                    assistant_message["content"] = content
-                if tool_calls:
-                    assistant_message["tool_calls"] = tool_calls
-                messages.append(assistant_message)
+                    # Append assistant message verbatim (with tool_calls) so the
+                    # next turn can include it in conversation history.
+                    assistant_message: dict[str, Any] = {"role": "assistant"}
+                    if content is not None:
+                        assistant_message["content"] = content
+                    if tool_calls:
+                        assistant_message["tool_calls"] = tool_calls
+                    messages.append(assistant_message)
 
-                if content:
-                    await _append_event(db, task_id, "thinking", {"text": content[:4000]})
+                    if content:
+                        await _append_event(db, task_id, "thinking", {"text": content[:4000]})
 
-                # No tool calls → terminal turn.
-                if not tool_calls:
-                    final_text = content or ""
-                    break
+                    # No tool calls → terminal turn.
+                    if not tool_calls:
+                        final_text = content or ""
+                        break
+
+                    await _save_checkpoint(db, task_id, messages, turn)
 
                 # Execute tool calls. Read-only ones run in parallel via
                 # asyncio.gather (the "v1 boss/worker" — multiple finds at
@@ -407,10 +430,12 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
                             "summary": _summarize_destructive(name, args),
                         })
                         await db.commit()
-                        approved, edited_args = await _park_for_approval(
-                            task_id, tc_id, APPROVAL_TIMEOUT_S,
+                        decision, edited_args, stored = await _park_for_approval(
+                            task_id, tc_id, name, APPROVAL_TIMEOUT_S,
                         )
-                        if not approved:
+                        if decision == "executed":
+                            return {"tool_call_id": tc_id, "content": stored or ""}
+                        if decision != "approved":
                             await _append_event(db, task_id, "approval_resolved", {
                                 "id": tc_id, "name": name, "approved": False,
                             })
@@ -454,6 +479,8 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
                             else:
                                 result_str = f"tool exception: {raw[:500]}"
 
+                    if name in DESTRUCTIVE_TOOLS:
+                        await _mark_executed(task_id, tc_id, result_str or "")
                     await _append_event(db, task_id, "tool_result", {
                         "id": tc_id, "name": name, "ok": ok,
                         "result_preview": (result_str or "")[:1000],
@@ -470,6 +497,7 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
                 for tr in tool_results:
                     messages.append({"role": "tool", "tool_call_id": tr["tool_call_id"], "content": tr["content"]})
                 await db.commit()
+                await _save_checkpoint(db, task_id, messages, turn + 1)
             else:
                 # Hit MAX_TASK_TURNS without an assistant final response.
                 final_text = "Reached the maximum turn limit without producing a summary."
@@ -516,8 +544,9 @@ async def tasks_create(
     ))
     await db.commit()
 
-    # Fire the loop detached from the request. It opens its own DB session.
-    asyncio.create_task(_run_task_loop(task_id, user.id, body.prompt.strip()))
+    # task_runtime's worker leases and runs it (survives restarts).
+    import task_runtime
+    task_runtime.wake()
     return {"id": task_id, "status": "queued"}
 
 
@@ -620,8 +649,17 @@ async def tasks_approve(
     )).scalar_one_or_none()
     if task is None:
         raise HTTPException(404, "task not found")
-    ok = await _resolve_approval(task_id, body.tool_call_id, body.approved, body.edited_args)
-    if not ok:
+    result = await db.execute(update(TaskApproval).where(
+        TaskApproval.task_id == task_id,
+        TaskApproval.tool_call_id == body.tool_call_id,
+        TaskApproval.status == "pending",
+    ).values(
+        status="approved" if body.approved else "denied",
+        edited_args=body.edited_args,
+        decided_at=datetime.now(timezone.utc),
+    ))
+    await db.commit()
+    if result.rowcount == 0:
         return {"ok": False, "reason": "no pending gate — likely timed out or already resolved"}
     return {"ok": True}
 
@@ -647,3 +685,73 @@ async def tasks_cancel(
     task.completed_at = datetime.now(timezone.utc)
     await db.commit()
     return {"ok": True, "status": "cancelled"}
+
+
+# ── Live updates (SSE) ────────────────────────────────────────────────────────
+# Polls Postgres per connection rather than holding in-process pub/sub, so it
+# works no matter which replica runs the task. One cheap query every 2s.
+
+STREAM_POLL_S = 2.0
+STREAM_PING_S = 15.0
+
+
+async def _task_snapshot(db: AsyncSession, user_id: int) -> dict[str, dict]:
+    """{task_id: {status, approval_needed, result_preview}} for recent tasks."""
+    since = datetime.now(timezone.utc) - timedelta(days=1)
+    rows = (await db.execute(
+        select(BackgroundTask.id, BackgroundTask.status, BackgroundTask.result_md, BackgroundTask.prompt)
+        .where(BackgroundTask.user_id == user_id, BackgroundTask.created_at >= since)
+        .order_by(desc(BackgroundTask.created_at)).limit(50)
+    )).all()
+    pending = set((await db.execute(
+        select(TaskApproval.task_id).where(
+            TaskApproval.task_id.in_([r.id for r in rows]), TaskApproval.status == "pending",
+        )
+    )).scalars().all()) if rows else set()
+    return {
+        r.id: {
+            "id": r.id,
+            "status": r.status,
+            "approval_needed": r.id in pending,
+            "prompt": (r.prompt or "")[:120],
+            "result_preview": (r.result_md or "")[:200],
+        }
+        for r in rows
+    }
+
+
+def _snapshot_changes(old: dict[str, dict], new: dict[str, dict]) -> list[dict]:
+    """Tasks whose status or approval state changed (or appeared)."""
+    out = []
+    for tid, cur in new.items():
+        prev = old.get(tid)
+        if prev is None or prev["status"] != cur["status"] or prev["approval_needed"] != cur["approval_needed"]:
+            out.append(cur)
+    return out
+
+
+async def tasks_stream(request: Request, user: User = Depends(current_user)):
+    """SSE: `event: task-update` whenever one of the caller's recent tasks
+    changes status or starts/stops waiting for approval. Pings every 15s."""
+    from fastapi.responses import StreamingResponse
+
+    user_id = user.id
+
+    async def gen():
+        async with SessionLocal() as db:
+            snap = await _task_snapshot(db, user_id)
+        last_ping = time.monotonic()
+        yield b": connected\n\n"
+        while not await request.is_disconnected():
+            await asyncio.sleep(STREAM_POLL_S)
+            async with SessionLocal() as db:
+                new = await _task_snapshot(db, user_id)
+            for change in _snapshot_changes(snap, new):
+                yield f"event: task-update\ndata: {json.dumps(change)}\n\n".encode()
+            snap = new
+            if time.monotonic() - last_ping >= STREAM_PING_S:
+                yield b": ping\n\n"
+                last_ping = time.monotonic()
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

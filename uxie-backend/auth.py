@@ -8,7 +8,7 @@ Flow:
 
 from __future__ import annotations
 
-import random
+import secrets
 import string
 from datetime import datetime, timedelta, timezone
 
@@ -49,8 +49,11 @@ class AuthResponse(BaseModel):
 
 # ── OTP helpers ───────────────────────────────────────────────────────────────
 
+OTP_MAX_ATTEMPTS = 5
+
+
 def _generate_otp() -> str:
-    return "".join(random.choices(string.digits, k=6))
+    return "".join(secrets.choice(string.digits) for _ in range(6))
 
 
 async def _send_email(to: str, code: str):
@@ -124,16 +127,25 @@ async def verify_otp(
     db: AsyncSession = Depends(get_db),
 ) -> AuthResponse:
     now = datetime.now(timezone.utc)
-    result = await db.execute(
+    # Match on the email's active code (at most one — send_otp retires older
+    # ones), then compare, so wrong guesses count against it.
+    otp = (await db.execute(
         select(OTP).where(
             OTP.email == body.email,
-            OTP.code == body.code,
             OTP.used == False,
             OTP.expires_at > now,
-        )
-    )
-    otp = result.scalar_one_or_none()
+        ).order_by(OTP.id.desc()).limit(1)
+    )).scalar_one_or_none()
     if not otp:
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+    if not secrets.compare_digest(otp.code.encode(), body.code.encode()):
+        otp.attempts = (otp.attempts or 0) + 1
+        locked = otp.attempts >= OTP_MAX_ATTEMPTS
+        if locked:
+            otp.used = True
+        await db.commit()
+        if locked:
+            raise HTTPException(status_code=400, detail="Too many attempts — request a new code")
         raise HTTPException(status_code=400, detail="Invalid or expired OTP")
 
     otp.used = True

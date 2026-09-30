@@ -449,7 +449,7 @@ async def llm_structure_meeting(
 
 # ── STT session token ─────────────────────────────────────────────────────────
 # If DEEPGRAM_PROJECT_ID is set, mint a per-session scoped key with short TTL.
-# Otherwise fall back to returning the master key (warn — legacy behavior).
+# If minting fails, stt_session returns 503 — the master key never leaves the server.
 
 class STTSessionResponse(BaseModel):
     token: str
@@ -494,20 +494,16 @@ async def stt_session(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(current_user),
 ) -> STTSessionResponse:
+    # One retry absorbs a transient Deepgram hiccup. The master key is never
+    # handed to clients — if minting keeps failing, voice fails closed.
     ephemeral, key_id = await _mint_deepgram_key(user.id)
-    if ephemeral:
-        await usage.record_stt_usage(db, user_id=user.id, deepgram_key_id=key_id)
-        return STTSessionResponse(
-            token=ephemeral,
-            expires_in=_settings.deepgram_session_ttl_seconds,
-        )
-
-    master = (_settings.deepgram_api_key or "").strip()
-    if not master:
-        raise HTTPException(500, "Deepgram API key not configured on server")
-    _log.warning(
-        "Returning master Deepgram key to user %s — set DEEPGRAM_PROJECT_ID to enable ephemeral keys",
-        user.id,
+    if not ephemeral:
+        ephemeral, key_id = await _mint_deepgram_key(user.id)
+    if not ephemeral:
+        _log.error("Deepgram ephemeral key mint failed twice for user %s", user.id)
+        raise HTTPException(503, "Voice is temporarily unavailable — please try again")
+    await usage.record_stt_usage(db, user_id=user.id, deepgram_key_id=key_id)
+    return STTSessionResponse(
+        token=ephemeral,
+        expires_in=_settings.deepgram_session_ttl_seconds,
     )
-    await usage.record_stt_usage(db, user_id=user.id, deepgram_key_id=None)
-    return STTSessionResponse(token=master, expires_in=3600)

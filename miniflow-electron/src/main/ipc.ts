@@ -4,6 +4,7 @@ import { ipcMain, shell, app } from "electron";
 import { autoUpdater } from "electron-updater";
 
 import { invoke } from "./api";
+import { clearSessionToken, syncSessionToken } from "./sessionToken";
 import { helper } from "./helper";
 import { IpcChannels } from "../shared/types";
 import type { Hotkey } from "../shared/types";
@@ -154,12 +155,18 @@ export function registerIpc() {
   ipcMain.handle(EXTRA.sendOtp, (_e, email: string, referralCode?: string) =>
     invoke("send_otp", { email, referral_code: referralCode ?? null })
   );
-  ipcMain.handle(EXTRA.verifyOtp, (_e, email: string, code: string) =>
-    invoke("verify_otp", { email, code })
-  );
+  ipcMain.handle(EXTRA.verifyOtp, async (_e, email: string, code: string) => {
+    const data = await invoke<Record<string, unknown>>("verify_otp", { email, code });
+    await syncSessionToken(); // move the new token into safeStorage
+    const { access_token: _token, ...rest } = data ?? {};
+    return { ...rest, access_token: _token ? "stored" : undefined };
+  });
   ipcMain.handle(EXTRA.getUserStatus, () => invoke("get_user_status", {}));
   ipcMain.handle(EXTRA.getUxieUser,   () => invoke("get_uxie_user", {}));
-  ipcMain.handle(EXTRA.logout,        () => invoke("logout_uxie", {}));
+  ipcMain.handle(EXTRA.logout,        async () => {
+    clearSessionToken();
+    return invoke("logout_uxie", {});
+  });
 
   // Auto-updater — called from Settings → "Check for updates".
   // Lifecycle events are pushed to renderers on the "updater:event"

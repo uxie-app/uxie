@@ -95,6 +95,34 @@ class BackgroundTask(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_now, index=True)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_now)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # Durable runtime (task_runtime.py). A worker leases the row while it
+    # runs; if the process dies the lease expires and another worker
+    # resumes from `checkpoint`. Rows with lease_owner NULL are not managed
+    # by the runtime (e.g. scheduled-brief shells) and are never reclaimed.
+    # Added to existing prod tables by db.ADDITIVE_COLUMNS.
+    lease_owner = Column(String, nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    attempt = Column(Integer, nullable=True, default=0)
+    checkpoint = Column(JSON, nullable=True)  # {"messages": [...], "turn": int}
+
+
+class TaskApproval(Base):
+    """Persisted approval gate for a destructive tool call inside a task.
+    Survives restarts and works across replicas (the in-memory gate did
+    neither). `status`: pending → approved | denied → executed. The stored
+    `result` makes execution idempotent when a task resumes mid-turn."""
+    __tablename__ = "task_approvals"
+    __table_args__ = (UniqueConstraint("task_id", "tool_call_id", name="uq_task_approval_call"),)
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(String, ForeignKey("background_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    tool_call_id = Column(String, nullable=False)
+    tool = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="pending")
+    edited_args = Column(JSON, nullable=True)
+    result = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
+    decided_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class TaskEvent(Base):

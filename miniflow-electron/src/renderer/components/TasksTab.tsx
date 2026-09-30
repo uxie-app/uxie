@@ -75,6 +75,12 @@ export function TasksTab() {
     refresh();
   }, [refresh]);
 
+  // Push: engine relays Railway /tasks/stream. Polling below stays as fallback.
+  useEffect(() => {
+    const off = (window.miniflow as any).onTaskUpdate?.(() => refresh());
+    return () => off?.();
+  }, [refresh]);
+
   // Poll the list every 5s while there's any non-terminal task.
   useEffect(() => {
     const hasActive = tasks.some(t => t.status === "queued" || t.status === "running");

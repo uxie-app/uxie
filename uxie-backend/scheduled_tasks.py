@@ -38,7 +38,7 @@ from typing import Any
 import httpx
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import current_user
@@ -583,6 +583,21 @@ async def _fire(st_id: str) -> None:
 # ── Cron worker ───────────────────────────────────────────────────────────────
 
 
+async def _claim(st_id: str, observed_last_fired: datetime | None) -> bool:
+    """Compare-and-set last_fired_at so that when several replicas (or an
+    overlapping deploy) see the same task as due, exactly one fires it."""
+    cond = (ScheduledTask.last_fired_at.is_(None) if observed_last_fired is None
+            else ScheduledTask.last_fired_at == observed_last_fired)
+    async with SessionLocal() as db:
+        result = await db.execute(
+            update(ScheduledTask)
+            .where(ScheduledTask.id == st_id, cond)
+            .values(last_fired_at=datetime.now(_tz.utc))
+        )
+        await db.commit()
+        return result.rowcount == 1
+
+
 async def cron_worker() -> None:
     """Polls every 60s. For each ScheduledTask whose run_time has passed
     in its user's tz today AND hasn't fired today, kick off `_fire`."""
@@ -593,15 +608,16 @@ async def cron_worker() -> None:
                 rows = (await db.execute(
                     select(ScheduledTask).where(ScheduledTask.enabled == True)  # noqa: E712
                 )).scalars().all()
-                due_ids: list[str] = []
+                due: list[tuple[str, datetime | None]] = []
                 for st in rows:
                     now = _now_in_tz(st.timezone)
                     if _is_due(st, now):
-                        due_ids.append(st.id)
-            for st_id in due_ids:
-                # Each fire opens its own DB session — keeps the cron
-                # session short.
-                asyncio.create_task(_fire(st_id))
+                        due.append((st.id, st.last_fired_at))
+            for st_id, observed in due:
+                # Only the replica that wins the claim fires. Each fire opens
+                # its own DB session — keeps the cron session short.
+                if await _claim(st_id, observed):
+                    asyncio.create_task(_fire(st_id))
         except asyncio.CancelledError:
             raise
         except Exception as e:

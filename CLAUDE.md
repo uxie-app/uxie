@@ -3,6 +3,9 @@
 ## Before any change: read PROCESS.md
 `PROCESS.md` at repo root is the change-and-release process. Pick the lane that matches the change (Quick / Standard / Full / Release) and run through that lane's checklist. Don't skip lanes silently — if you skip, write down why in the PR description. The bug-class scan section in PROCESS.md captures every regression we've already eaten; check it off before pushing.
 
+## Roadmap work: follow WORKFLOW.md
+Multi-agent / long-running agent roadmap work follows `WORKFLOW.md`: think, plan, build, test, review, report. `PROGRESS.md` is the running log and holds the "Up next" queue, and every unit ends by updating it. Claude never commits or pushes.
+
 ## What this is
 Uxie is a voice-powered desktop agent. Users speak → Uxie dictates or runs agentic commands. macOS today; Windows port in progress (same repo, conditional code). Stack: Electron (TypeScript/React) + Python FastAPI engine (PyInstaller bundle) + Rust native helper (Cargo workspace, one crate per OS) + Railway FastAPI backend.
 

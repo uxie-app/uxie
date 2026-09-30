@@ -16,6 +16,8 @@ import {
   onApprovalResolved,
 } from "./widgetState";
 import { showMeetingDetectedNotification } from "./meetingNotifications";
+import { showTaskNotification } from "./taskNotifications";
+import { syncSessionToken } from "./sessionToken";
 
 let ws: WebSocket | null = null;
 let getWindows: (() => BrowserWindow[]) = () => [];
@@ -32,7 +34,12 @@ export function connectWs(): void {
   if (ws && ws.readyState === WebSocket.OPEN) return;
   ws = new WebSocket(WS_URL);
 
-  ws.on("open", () => console.log("[ws] connected"));
+  ws.on("open", () => {
+    console.log("[ws] connected");
+    // Engine keeps the JWT in memory only — hand it over on every connect
+    // (covers app start and engine restarts).
+    void syncSessionToken();
+  });
   ws.on("close", () => {
     console.log("[ws] closed, reconnecting in 2s");
     ws = null;
@@ -63,6 +70,14 @@ export function connectWs(): void {
         showMeetingDetectedNotification(msg.payload as any);
       } catch (e) {
         console.error("[meeting] notification failed:", e);
+      }
+    }
+
+    if (msg.event === "task-update") {
+      try {
+        showTaskNotification(msg.payload as any);
+      } catch (e) {
+        console.error("[tasks] notification failed:", e);
       }
     }
 
@@ -121,6 +136,7 @@ function forwardToRenderer(event: string, payload: unknown): void {
     event === "meeting:detected"    ? "meeting:detected" :
     event === "meeting:transcript-update" ? "meeting:transcript-update" :
     event === "meeting:interim-transcript" ? "meeting:interim-transcript" :
+    event === "task-update"         ? "tasks:update" :
     null;
   if (!channel) return;
   // Broadcast to every live BrowserWindow exactly ONCE. We used to also loop

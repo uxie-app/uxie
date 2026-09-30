@@ -199,6 +199,8 @@ const api = {
   onMeetingInterimTranscript: (cb: (m: any) => void) => listen("meeting:interim-transcript", cb),
   onMeetingsRefresh:   (cb: () => void) => listen("meetings:refresh", () => cb()),
   onMeetingsReveal:    (cb: () => void) => listen("meetings:reveal", () => cb()),
+  onTaskUpdate:        (cb: (t: any) => void) => listen("tasks:update", cb),
+  onTasksReveal:       (cb: () => void) => listen("tasks:reveal", () => cb()),
 
   // Dictionary (word → replacement)
   getDictionary:      () => ipcRenderer.invoke("dict:get"),

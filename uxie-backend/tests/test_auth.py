@@ -105,3 +105,41 @@ async def test_protected_route_bad_token(client: AsyncClient):
 
 async def _mock_send_email(to: str, code: str):
     pass  # no-op: don't call Resend in tests
+
+
+@pytest.mark.asyncio
+async def test_otp_locks_after_max_wrong_attempts(client: AsyncClient, monkeypatch):
+    import auth
+    monkeypatch.setattr(auth, "_send_email", _mock_send_email)
+
+    email = "lockout@example.com"
+    await client.post("/auth/send-otp", json={"email": email})
+    async with _TestSessionLocal() as s:
+        real = (await s.execute(select(OTP.code).where(OTP.email == email, OTP.used == False))).scalar_one()
+    wrong = "000000" if real != "000000" else "111111"
+
+    for _ in range(auth.OTP_MAX_ATTEMPTS - 1):
+        resp = await client.post("/auth/verify-otp", json={"email": email, "code": wrong})
+        assert resp.json()["detail"] == "Invalid or expired OTP"
+    resp = await client.post("/auth/verify-otp", json={"email": email, "code": wrong})
+    assert resp.json()["detail"] == "Too many attempts — request a new code"
+
+    # The correct code no longer works once locked.
+    resp = await client.post("/auth/verify-otp", json={"email": email, "code": real})
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_stt_session_never_returns_master_key(client: AsyncClient, monkeypatch):
+    import proxy
+    token = await create_user_and_token(client, "stt-fail@example.com")
+    calls = []
+
+    async def _fail(user_id):
+        calls.append(user_id)
+        return None, None
+
+    monkeypatch.setattr(proxy, "_mint_deepgram_key", _fail)
+    resp = await client.post("/stt/session", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 503
+    assert len(calls) == 2  # one retry

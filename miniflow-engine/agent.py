@@ -357,7 +357,38 @@ LOCAL_TOOLS = [
     }},
     {"type": "function", "function": {"name": "create_file", "description": "Create a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string", "default": ""}}, "required": ["path"]}}},
     {"type": "function", "function": {"name": "move_file", "description": "Move or rename a file", "parameters": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}}, "required": ["from", "to"]}}},
+    {"type": "function", "function": {
+        "name": "start_background_task",
+        "description": (
+            "Hand a multi-step or long-running request to Uxie's cloud background agent "
+            "(keeps running if the laptop sleeps; user gets a notification when done). "
+            "Use for research, summarizing many emails/docs, or anything needing several "
+            "searches and reads. Do NOT use for single quick actions you can do directly."
+        ),
+        "parameters": {"type": "object", "properties": {"goal": {"type": "string", "description": "The full request, self-contained"}}, "required": ["goal"]},
+    }},
 ]
+
+
+async def _start_background_task(goal: str) -> tuple[bool, str]:
+    """POST the goal to Railway /tasks/create (durable task runtime)."""
+    import httpx
+    jwt = config.get_jwt()
+    if not jwt:
+        return False, "Sign in to Uxie to use background tasks."
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"{config.get_uxie_backend_url()}/tasks/create",
+                headers={"Authorization": f"Bearer {jwt}"},
+                json={"prompt": goal[:4000]},
+            )
+        if r.status_code == 429:
+            return False, "Background task limit reached — try again later."
+        r.raise_for_status()
+        return True, f"On it — running in the background (task {r.json().get('id', '')[-6:]}). I'll notify you when it's done."
+    except httpx.HTTPError as e:
+        return False, f"Couldn't start background task: {e}"
 
 
 # ── App focus helper ──
@@ -1019,7 +1050,10 @@ async def execute_command(text: str) -> list[dict]:
                     continue
 
             # Route: local → OAuth connector (Google/Slack) → MCP (GitHub/Linear/Notion/Playwright)
-            success, result_msg = _execute_local(fn_name, args)
+            if fn_name == "start_background_task":
+                success, result_msg = await _start_background_task(args.get("goal", ""))
+            else:
+                success, result_msg = _execute_local(fn_name, args)
             if result_msg == f"__unknown__:{fn_name}":
                 success, result_msg = connector_registry.execute_connector_tool(fn_name, args, oauth.get_token)
             if not success and "No connector found" in result_msg:

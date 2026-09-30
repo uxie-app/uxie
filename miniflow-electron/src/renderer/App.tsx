@@ -51,7 +51,10 @@ export function App() {
     const offReveal = (window.miniflow as any).onMeetingsReveal?.(() =>
       setTab("meetings")
     );
-    return () => { offStatus(); offAct(); offReveal?.(); };
+    const offTasksReveal = (window.miniflow as any).onTasksReveal?.(() =>
+      setTab("tasks")
+    );
+    return () => { offStatus(); offAct(); offReveal?.(); offTasksReveal?.(); };
   }, []);
 
   function closeOnboarding() {
