@@ -606,3 +606,46 @@ async def test_slack_connector_dispatch_with_mocked_http(client, mock_llm, db_se
     assert slack_results, f"expected tool_call_result for tc_slack_1; got events {names}"
     assert slack_results[0]["ok"] is True
     assert "final_text" in names
+
+
+@pytest.mark.asyncio
+async def test_default_agent_policy_tightens_interactive_loop(client, mock_llm, db_session):
+    """Default agent denies open_url → not advertised; if called anyway it's
+    blocked with the existing tool_call_result event (no new event names)."""
+    from sqlalchemy import select
+    from db import User as UserModel
+    import agents as agents_mod
+
+    token = await create_user_and_token(client, "ios-policy@test.com")
+    user = (await db_session.execute(select(UserModel).where(UserModel.email == "ios-policy@test.com"))).scalar_one()
+    default = await agents_mod.ensure_default_agent(db_session, user.id)
+    default.tool_policy = {"open_url": "deny"}
+    default.instructions = "Always answer in French."
+    await db_session.commit()
+
+    seen: dict = {}
+
+    async def capture(messages, tools, model, provider):
+        if "tools" not in seen:
+            seen["tools"] = [t["function"]["name"] for t in tools]
+            seen["system"] = messages[0]["content"]
+            return _llm_response(tool_calls=[{
+                "id": "c1", "type": "function",
+                "function": {"name": "open_url", "arguments": '{"url": "https://x.com"}'},
+            }]), 5, {}
+        return _llm_response(content="ok"), 5, {}
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(agent_mod, "_call_llm", capture)
+    try:
+        resp = await client.post(
+            "/agent/execute",
+            json={"transcript": "open x.com", "mode": "command", "tools_available_on_client": ["open_url"]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        mp.undo()
+    assert "open_url" not in seen["tools"]
+    assert "Always answer in French." in seen["system"]
+    assert "Blocked by agent permissions." in resp.text
+    assert "client_tool_invoke" not in resp.text

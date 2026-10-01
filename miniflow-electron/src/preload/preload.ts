@@ -175,10 +175,16 @@ const api = {
   setAutoDetectMeetings: (enabled: boolean) => ipcRenderer.invoke("meetings:setAutoDetect", enabled),
   getShareMeetingsWithAdmin: () => ipcRenderer.invoke("meetings:getShareAdmin"),
   setShareMeetingsWithAdmin: (enabled: boolean) => ipcRenderer.invoke("meetings:setShareAdmin", enabled),
+  getDesktopContextEnabled: () => ipcRenderer.invoke("context:getEnabled"),
+  setDesktopContextEnabled: (enabled: boolean) => ipcRenderer.invoke("context:setEnabled", enabled),
 
   // Background tasks (v1.1.0)
   createTask:   (prompt: string) => ipcRenderer.invoke("tasks:create", prompt),
   listTasks:    () => ipcRenderer.invoke("tasks:list"),
+  listAgents:   () => ipcRenderer.invoke("agents:list"),
+  createAgent:  (body: Record<string, unknown>) => ipcRenderer.invoke("agents:create", body),
+  updateAgent:  (id: string, body: Record<string, unknown>) => ipcRenderer.invoke("agents:update", id, body),
+  deleteAgent:  (id: string) => ipcRenderer.invoke("agents:delete", id),
   getTask:      (id: string) => ipcRenderer.invoke("tasks:get", id),
   cancelTask:   (id: string) => ipcRenderer.invoke("tasks:cancel", id),
   approveTask:  (id: string, toolCallId: string, approved: boolean, editedArgs?: any) =>

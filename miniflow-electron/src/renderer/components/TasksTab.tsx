@@ -14,6 +14,8 @@ type Task = {
   id: string;
   prompt: string;
   status: TaskStatus;
+  agent_name?: string | null;
+  waiting?: boolean;
   result_md: string | null;
   error: string | null;
   created_at: string;
@@ -213,7 +215,9 @@ function TaskList({
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <StatusPill status={t.status} />
-              <span style={{ fontSize: 11, color: "#888" }}>{formatRelative(t.created_at)}</span>
+              <span style={{ fontSize: 11, color: "#888" }}>
+                {t.agent_name ? `${t.agent_name} · ` : ""}{t.waiting ? "Waiting · " : ""}{formatRelative(t.created_at)}
+              </span>
             </div>
           </button>
         ))

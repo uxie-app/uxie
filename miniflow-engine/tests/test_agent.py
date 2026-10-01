@@ -96,6 +96,8 @@ async def test_execute_command_routes_connector_tool(configured_agent, monkeypat
     import oauth
     monkeypatch.setattr(oauth, "get_connected_providers", lambda: ["slack"])
     monkeypatch.setattr(oauth, "get_token", lambda p: {"access_token": "xoxb-test"})
+    # slack_send_message is approval-gated; this test is about routing, so approve.
+    monkeypatch.setattr(configured_agent, "_approval_gate", AsyncMock(return_value=True))
 
     with patch("llm.chat", AsyncMock(side_effect=responses)):
         result = await configured_agent.execute_command("Send hi to #general on slack")
@@ -116,7 +118,7 @@ async def test_execute_command_halts_on_llm_error(configured_agent):
 
 @pytest.mark.asyncio
 async def test_execute_command_respects_max_turns(configured_agent):
-    """If the LLM keeps calling tools forever, we must stop after max_turns (8)."""
+    """If the LLM keeps calling tools forever, we must stop after max_turns (4)."""
     import llm
     # Always return a tool call — an infinite loop unless max_turns saves us
     infinite_tool = llm.ToolCall(id="x", name="clipboard_read", arguments_json="{}")
@@ -126,6 +128,6 @@ async def test_execute_command_respects_max_turns(configured_agent):
          patch("pyperclip.paste", return_value="clipboard contents"):
         result = await configured_agent.execute_command("read clipboard forever")
 
-    # 8 turns, each produces 1 tool result → exactly 8 clipboard_read actions
+    # 4 turns, each produces 1 tool result → exactly 4 clipboard_read actions
     tool_actions = [r for r in result if r["action"] == "clipboard_read"]
-    assert len(tool_actions) == 8
+    assert len(tool_actions) == 4

@@ -43,6 +43,7 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import model_gateway
 from auth import current_user
 from db import User, get_db
 from db_ios import Conversation, Turn
@@ -73,8 +74,8 @@ MAX_TURNS = 4
 # tasks of this size, and quality is plenty for an agent that picks one
 # tool from a small registry. Falls back to OpenAI implicitly via
 # proxy._llm_base_and_key if GROQ_API_KEY isn't set.
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
-DEFAULT_PROVIDER = "groq"
+# Models come from model_gateway roles: "voice_agent" (this loop) and
+# "dictation_fix".
 
 # Tools that always require user approval before executing. Server-side
 # (connector) tools and client-side tools both can be marked destructive —
@@ -393,6 +394,17 @@ def _is_server_tool(name: str) -> bool:
     return False
 
 
+async def _default_agent(db: AsyncSession, user_id: int):
+    """The user's default agent, or None if it can't be loaded (the loop
+    then runs with built-in behavior)."""
+    import agents as _agents
+    try:
+        return await _agents.ensure_default_agent(db, user_id)
+    except Exception:
+        _log.warning("default agent lookup failed", exc_info=True)
+        return None
+
+
 # ── Tool schema assembly ──────────────────────────────────────────────────────
 
 async def _build_tool_schemas(
@@ -569,11 +581,21 @@ async def _command_loop(
         {"role": "user", "content": transcript},
     ]
     tools = await _build_tool_schemas(client_tools, db, user)
+    # The user's default agent (agents.py) can only tighten this loop:
+    # "deny" hides + blocks a tool, "require_approval" adds the approval
+    # gate. "allow" never removes the gate on DESTRUCTIVE_TOOLS here.
+    default_agent = await _default_agent(db, user.id)
+    agent_policy: dict = (default_agent.tool_policy or {}) if default_agent else {}
+    tools = [t for t in tools if agent_policy.get((t.get("function") or {}).get("name")) != "deny"]
+    if default_agent is not None and default_agent.instructions:
+        messages[0]["content"] += "\n\nThe user's standing instructions:\n" + default_agent.instructions
+
+    llm_provider, llm_model = model_gateway.resolve("voice_agent")
 
     for turn_num in range(MAX_TURNS):
         # ── 1. Call the LLM ──
         try:
-            data, dt_ms, llm_usage = await _call_llm(messages, tools, DEFAULT_MODEL, DEFAULT_PROVIDER)
+            data, dt_ms, llm_usage = await _call_llm(messages, tools, llm_model, llm_provider)
         except Exception as e:  # noqa: BLE001
             yield _sse("error", {"code": "llm_call_failed", "message": str(e), "retryable": True})
             return
@@ -585,7 +607,7 @@ async def _command_loop(
         _log.info(
             "agent.turn session=%s turn=%d model=%s llm_ms=%d tools=%d "
             "prompt_tokens=%d completion_tokens=%d",
-            session_id, turn_num, DEFAULT_MODEL, dt_ms, len(tools),
+            session_id, turn_num, llm_model, dt_ms, len(tools),
             int(llm_usage.get("prompt_tokens", 0) or 0),
             int(llm_usage.get("completion_tokens", 0) or 0),
         )
@@ -595,8 +617,8 @@ async def _command_loop(
             await _usage.record_llm_usage(
                 db,
                 user_id=user.id,
-                provider=DEFAULT_PROVIDER,
-                model=DEFAULT_MODEL,
+                provider=llm_provider,
+                model=llm_model,
                 action="command",
                 prompt_tokens=int(llm_usage.get("prompt_tokens", 0) or 0),
                 completion_tokens=int(llm_usage.get("completion_tokens", 0) or 0),
@@ -637,7 +659,12 @@ async def _command_loop(
             ok: bool
             yielded_result_event = False
 
-            if tc_name in DESTRUCTIVE_TOOLS:
+            if agent_policy.get(tc_name) == "deny":
+                tool_result_for_llm = "This tool is turned off in the user's agent settings. Tell the user."
+                ok = False
+                yield _sse("tool_call_result", {"id": tc_id, "ok": False, "result": "Blocked by agent permissions."})
+                yielded_result_event = True
+            elif tc_name in DESTRUCTIVE_TOOLS or agent_policy.get(tc_name) == "require_approval":
                 # Approval gate — common to client- and server-side destructive tools.
                 yield _sse("approval_needed", {
                     "session_id": session_id,
@@ -727,7 +754,8 @@ async def _dictation_fix(transcript: str, user: User) -> str:
         {"role": "user", "content": transcript},
     ]
     try:
-        data, _dt, _u = await _call_llm(messages, [], DEFAULT_MODEL, DEFAULT_PROVIDER)
+        fix_provider, fix_model = model_gateway.resolve("dictation_fix")
+        data, _dt, _u = await _call_llm(messages, [], fix_model, fix_provider)
         choice = (data.get("choices") or [{}])[0].get("message") or {}
         return choice.get("content") or transcript
     except Exception:

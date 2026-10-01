@@ -232,11 +232,12 @@ async def execute(
     """
     try:
         if name == "gmail_send":
-            await _gmail_request(
+            sent = await _gmail_request(
                 "POST", "/users/me/messages/send", token, http, db,
                 json=_make_mime(args["to"], args["subject"], args["body"]),
             )
-            return True, f"Email sent to {args['to']}."
+            # thread_id lets a background task wait_for_email_reply on it.
+            return True, f"Email sent to {args['to']} (thread_id: {sent.get('threadId', '?')})."
 
         elif name == "gmail_search":
             res = await _gmail_request(

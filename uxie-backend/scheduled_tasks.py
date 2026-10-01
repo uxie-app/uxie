@@ -42,6 +42,7 @@ from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import current_user
+import model_gateway
 from db import SessionLocal, User, get_db
 from db_ios import BackgroundTask, OAuthToken, ScheduledTask, TaskEvent
 from proxy import _llm_base_and_key, get_http
@@ -266,13 +267,14 @@ async def _morning_brief_generate(db: AsyncSession, user: User) -> str:
         parts.append(f"## Slack unread / mentions (last 24h)\n{sections['slack']}\n")
     user_msg = "\n".join(parts)
 
-    base_url, api_key = _llm_base_and_key("openai")
+    provider, model = model_gateway.resolve("briefing")
+    base_url, api_key = _llm_base_and_key(provider)
     http = get_http()
     resp = await http.post(
         f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
-            "model": "gpt-4o",
+            "model": model,
             "temperature": 0.3,
             "messages": [
                 {"role": "system", "content": _MORNING_BRIEF_SYSTEM_PROMPT},
@@ -358,12 +360,13 @@ async def _evening_recap_generate(db: AsyncSession, user: User) -> str:
         f"## Calendar context\n{sections.get('calendar', '(none)')}\n"
     )
 
-    base_url, api_key = _llm_base_and_key("openai")
+    provider, model = model_gateway.resolve("briefing")
+    base_url, api_key = _llm_base_and_key(provider)
     resp = await get_http().post(
         f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
-            "model": "gpt-4o", "temperature": 0.3,
+            "model": model, "temperature": 0.3,
             "messages": [
                 {"role": "system", "content": _EVENING_RECAP_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -435,12 +438,13 @@ async def _weekly_digest_generate(db: AsyncSession, user: User) -> str:
         f"## Meetings this week\n{sections.get('calendar', '(none)')}\n"
     )
 
-    base_url, api_key = _llm_base_and_key("openai")
+    provider, model = model_gateway.resolve("briefing")
+    base_url, api_key = _llm_base_and_key(provider)
     resp = await get_http().post(
         f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
-            "model": "gpt-4o", "temperature": 0.3,
+            "model": model, "temperature": 0.3,
             "messages": [
                 {"role": "system", "content": _WEEKLY_DIGEST_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},

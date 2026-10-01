@@ -19,7 +19,7 @@ pyobjc>=9.0; sys_platform == "darwin"
 python-dotenv==1.0.1
 pyperclip==1.9.0
 google-auth>=2.0
-litellm==1.52.0
+litellm==1.53.9   # 1.52.0 was removed from PyPI; closest available
 sentry-sdk[fastapi]==2.20.0
 pytest==8.3.3
 pytest-asyncio==0.24.0

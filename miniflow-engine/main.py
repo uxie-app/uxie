@@ -566,6 +566,29 @@ async def _relay_task_stream() -> None:
         backoff = min(backoff * 2, 60)
 
 
+async def _backend_json(method: str, path: str, body: dict | None = None) -> dict:
+    """Authenticated call to the Railway backend; errors come back as {"error": ...}."""
+    import httpx
+    jwt = config.get_jwt()
+    if not jwt:
+        return {"error": "not signed in"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.request(
+                method, f"{config.get_uxie_backend_url()}{path}",
+                headers={"Authorization": f"Bearer {jwt}"}, json=body,
+            )
+        if r.status_code >= 400:
+            try:
+                detail = r.json().get("detail", r.text)
+            except ValueError:
+                detail = r.text
+            return {"error": str(detail)[:300]}
+        return r.json()
+    except httpx.HTTPError as e:
+        return {"error": str(e)}
+
+
 async def _tasks_create(prompt: str) -> dict:
     """Create a background task on Railway. Returns {id, status}."""
     import httpx
@@ -845,6 +868,12 @@ async def invoke(command: str, body: dict = {}):
         "logout_uxie":           lambda b: config.clear_jwt(),
         "get_uxie_user":         lambda b: config.get_uxie_user(),
         "set_session_token":     lambda b: config.set_session_token(b.get("token") or ""),
+        "get_desktop_context_enabled": lambda b: {"enabled": config.get_desktop_context_enabled()},
+        "set_desktop_context_enabled": lambda b: (config.set_desktop_context_enabled(bool(b.get("enabled", True))) or {"ok": True}),
+        "agents_list":           lambda b: _backend_json("GET", "/agents"),
+        "agents_create":         lambda b: _backend_json("POST", "/agents", b),
+        "agents_update":         lambda b: _backend_json("PATCH", f"/agents/{b['id']}", {k: v for k, v in b.items() if k != "id"}),
+        "agents_delete":         lambda b: _backend_json("DELETE", f"/agents/{b['id']}"),
         "take_file_token":       lambda b: config.take_file_token(),
         # Approval widget
         "resolve_approval":      lambda b: agent.resolve_approval(

@@ -58,10 +58,12 @@ def test_save_and_clear_user_name():
 
 # ── LLM config ────────────────────────────────────────────────────────────────
 
-def test_default_llm_config_has_openai_active():
+def test_default_llm_provider_is_uxie():
+    # CLAUDE.md: the default must stay "uxie" so all LLM calls go through
+    # the Railway backend (no user-facing API keys).
     import config
     cfg = config.get_llm_config()
-    assert cfg["active"] == "openai"
+    assert cfg["active"] == "uxie"
     assert "anthropic" in cfg["providers"]
     assert cfg["providers"]["openai"]["model"] == "gpt-4o"
 

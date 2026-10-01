@@ -12,7 +12,9 @@ from tests.conftest import _TestSessionLocal, create_user_and_token
 async def test_health(client: AsyncClient):
     resp = await client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["db"] == "ok"
 
 
 @pytest.mark.asyncio

@@ -231,12 +231,18 @@ export function registerIpc() {
   ipcMain.handle("meetings:setAutoDetect", (_e, enabled: boolean) =>
     invoke("set_auto_detect_meetings", { enabled }));
   ipcMain.handle("meetings:getShareAdmin", () => invoke("get_share_meetings_with_admin", {}));
+  ipcMain.handle("context:getEnabled", () => invoke("get_desktop_context_enabled", {}));
+  ipcMain.handle("context:setEnabled", (_e, enabled: boolean) => invoke("set_desktop_context_enabled", { enabled }));
   ipcMain.handle("meetings:setShareAdmin", (_e, enabled: boolean) =>
     invoke("set_share_meetings_with_admin", { enabled }));
 
   // Background tasks (v1.1.0)
   ipcMain.handle("tasks:create", (_e, prompt: string) => invoke("tasks_create", { prompt }));
   ipcMain.handle("tasks:list",   () => invoke("tasks_list", {}));
+  ipcMain.handle("agents:list",   () => invoke("agents_list", {}));
+  ipcMain.handle("agents:create", (_e, body: Record<string, unknown>) => invoke("agents_create", body));
+  ipcMain.handle("agents:update", (_e, id: string, body: Record<string, unknown>) => invoke("agents_update", { ...body, id }));
+  ipcMain.handle("agents:delete", (_e, id: string) => invoke("agents_delete", { id }));
   ipcMain.handle("tasks:get",    (_e, id: string) => invoke("tasks_get", { id }));
   ipcMain.handle("tasks:cancel", (_e, id: string) => invoke("tasks_cancel", { id }));
   ipcMain.handle("tasks:approve",

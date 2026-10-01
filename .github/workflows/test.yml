@@ -1,0 +1,62 @@
+# Runs every test suite on PRs and on pushes to main/staging.
+# Separate from build.yml (manual, builds + signs the apps).
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, staging]
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: uxie-backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: uxie-backend/requirements.txt
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+
+  engine:
+    runs-on: macos-14   # engine ships on macOS; matches build.yml
+    defaults:
+      run:
+        working-directory: miniflow-engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: miniflow-engine/requirements.txt
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+        timeout-minutes: 10
+
+  desktop:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: miniflow-electron
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: miniflow-electron/package-lock.json
+      # Scripts skipped: unit tests and typecheck don't need the Electron binary.
+      - run: npm ci --ignore-scripts
+      - run: npx tsc --noEmit -p tsconfig.json
+      - run: npx tsc --noEmit -p tsconfig.main.json
+      - run: npx jest

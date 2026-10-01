@@ -8,27 +8,39 @@ from unittest.mock import patch
 import pytest
 
 
-def test_default_hotkey_is_fn_hold():
+def test_default_hotkey_has_dictation_and_command():
     import hotkey
     assert hotkey.get_hotkey() == {
-        "mode": "hold_to_talk",
-        "modifier": "fn",
-        "key": None,
+        "dictation": {"mode": "hold_to_talk", "modifier": "fn", "key": None},
+        "command":   {"mode": "press_to_toggle", "modifier": "option", "key": "space"},
     }
 
 
 def test_set_hotkey_valid_modifier_plus_key():
     import hotkey
-    result = hotkey.set_hotkey({"mode": "hold_to_talk", "modifier": "option", "key": "space"})
-    assert result == {"mode": "hold_to_talk", "modifier": "option", "key": "space"}
+    result = hotkey.set_hotkey({"dictation": {"mode": "hold_to_talk", "modifier": "shift", "key": "space"}})
+    assert result["dictation"] == {"mode": "hold_to_talk", "modifier": "shift", "key": "space"}
+    assert result["command"] == hotkey.DEFAULT_COMMAND
     assert hotkey.get_hotkey() == result
 
 
 def test_set_hotkey_persists_across_reads():
     import hotkey
-    hotkey.set_hotkey({"mode": "press_to_toggle", "modifier": "cmd", "key": "d"})
-    fresh = json.loads(hotkey.HOTKEY_FILE.read_text())
-    assert fresh == {"mode": "press_to_toggle", "modifier": "cmd", "key": "d"}
+    result = hotkey.set_hotkey({"dictation": {"mode": "press_to_toggle", "modifier": "cmd", "key": "d"}})
+    assert json.loads(hotkey.HOTKEY_FILE.read_text()) == result
+
+
+def test_legacy_flat_config_migrates_into_dictation():
+    import hotkey
+    result = hotkey.set_hotkey({"mode": "hold_to_talk", "modifier": "cmd", "key": "f1"})
+    assert result["dictation"] == {"mode": "hold_to_talk", "modifier": "cmd", "key": "f1"}
+    assert result["command"] == hotkey.DEFAULT_COMMAND
+
+
+def test_dictation_and_command_must_differ():
+    import hotkey
+    with pytest.raises(ValueError):
+        hotkey.set_hotkey({"dictation": {"mode": "hold_to_talk", "modifier": "option", "key": "space"}})
 
 
 @pytest.mark.parametrize("bad", [
@@ -46,9 +58,9 @@ def test_set_hotkey_rejects_invalid(bad):
 
 def test_reset_hotkey_restores_default():
     import hotkey
-    hotkey.set_hotkey({"mode": "hold_to_talk", "modifier": "shift", "key": "space"})
+    hotkey.set_hotkey({"dictation": {"mode": "hold_to_talk", "modifier": "shift", "key": "f2"}})
     reset = hotkey.reset_hotkey()
-    assert reset == {"mode": "hold_to_talk", "modifier": "fn", "key": None}
+    assert reset == hotkey.DEFAULT_HOTKEY
     assert hotkey.get_hotkey() == reset
 
 
@@ -56,19 +68,15 @@ def test_corrupt_file_falls_back_to_defaults():
     import hotkey
     hotkey.HOTKEY_FILE.parent.mkdir(exist_ok=True)
     hotkey.HOTKEY_FILE.write_text("NOT JSON")
-    assert hotkey.get_hotkey() == {
-        "mode": "hold_to_talk", "modifier": "fn", "key": None,
-    }
+    assert hotkey.get_hotkey() == hotkey.DEFAULT_HOTKEY
 
 
 def test_missing_fields_backfilled_from_defaults():
     import hotkey
     hotkey.HOTKEY_FILE.parent.mkdir(exist_ok=True)
     hotkey.HOTKEY_FILE.write_text(json.dumps({"modifier": "control"}))
-    hk = hotkey.get_hotkey()
-    assert hk["modifier"] == "control"
-    assert hk["mode"] == "hold_to_talk"
-    assert hk["key"] is None
+    hk = hotkey.get_hotkey()["dictation"]
+    assert hk == {"mode": "hold_to_talk", "modifier": "control", "key": None}
 
 
 def test_sighup_sent_when_pidfile_exists(tmp_path):

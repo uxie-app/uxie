@@ -36,13 +36,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import current_user
 from db import SessionLocal, User, get_db
-from db_ios import BackgroundTask, TaskApproval, TaskEvent
+import model_gateway
+from events import WAIT_TOOL_SCHEMAS, WAIT_TOOLS, build_wait
+from db_ios import Agent, BackgroundTask, TaskApproval, TaskEvent
 from limits import check_and_increment, check_burst
 from proxy import _llm_base_and_key, get_http
 from settings import get_settings
@@ -78,13 +80,11 @@ DESTRUCTIVE_TOOLS: set[str] = {
 }
 
 # Union — what the agent loop will accept.
-ALL_ALLOWED_TOOLS: set[str] = READ_ONLY_TOOLS | DESTRUCTIVE_TOOLS
+ALL_ALLOWED_TOOLS: set[str] = READ_ONLY_TOOLS | DESTRUCTIVE_TOOLS | WAIT_TOOLS
 
 # Approval window for a parked destructive tool call before auto-cancel.
 APPROVAL_TIMEOUT_S = 300
 
-DEFAULT_MODEL = "gpt-4o"
-DEFAULT_PROVIDER = "openai"
 
 # Per-user burst limit for /tasks/create. Belt-and-braces on top of the
 # monthly command counter.
@@ -197,6 +197,48 @@ async def _park_for_approval(
         await asyncio.sleep(APPROVAL_POLL_S)
 
 
+def _with_context(prompt: str, ctx: dict | None) -> str:
+    """Prefix the task prompt with the desktop context it was created in."""
+    if not ctx:
+        return prompt
+    labels = [("app", "App"), ("window_title", "Window"), ("url", "URL"), ("selected_text", "Selected text")]
+    lines = [f"{label}: {ctx[k]}" for k, label in labels if ctx.get(k)]
+    return ("[Desktop context when the user asked — use it to resolve 'this', 'here', 'that']\n"
+            + "\n".join(lines) + "\n\n" + prompt)
+
+
+def _effective_policy(agent: Agent | None) -> dict[str, str]:
+    """tool → allow | require_approval | deny. Built-in defaults (read-only
+    allowed, destructive gated) overlaid with the agent's own policy."""
+    policy = {t: "allow" for t in READ_ONLY_TOOLS | WAIT_TOOLS}
+    policy.update({t: "require_approval" for t in DESTRUCTIVE_TOOLS})
+    if agent is not None and agent.tool_policy:
+        policy.update({k: v for k, v in agent.tool_policy.items() if k in policy})
+    return policy
+
+
+async def _load_agent(db: AsyncSession, user_id: int, agent_id: str | None) -> Agent:
+    import agents as _agents
+    if agent_id:
+        agent = (await db.execute(
+            select(Agent).where(Agent.id == agent_id, Agent.user_id == user_id)
+        )).scalar_one_or_none()
+        if agent is not None:
+            return agent
+    return await _agents.ensure_default_agent(db, user_id)
+
+
+async def _auto_approve(task_id: str, tool_call_id: str, tool: str) -> None:
+    async with SessionLocal() as s:
+        exists = (await s.execute(select(TaskApproval.id).where(
+            TaskApproval.task_id == task_id, TaskApproval.tool_call_id == tool_call_id,
+        ))).scalar_one_or_none()
+        if exists is None:
+            s.add(TaskApproval(task_id=task_id, tool_call_id=tool_call_id, tool=tool,
+                               status="approved", decided_at=datetime.now(timezone.utc)))
+            await s.commit()
+
+
 async def _mark_executed(task_id: str, tool_call_id: str, result: str) -> None:
     async with SessionLocal() as s:
         await s.execute(update(TaskApproval).where(
@@ -247,7 +289,7 @@ this mode — only the read-only tools above are available.
 """
 
 
-def _build_system_prompt(tool_schemas: list[dict]) -> str:
+def _build_system_prompt(tool_schemas: list[dict], agent: Agent | None = None) -> str:
     """Render SYSTEM_PROMPT_TEMPLATE with the actual list of tools the LLM
     has access to. Listing them inline (not just via the OpenAI tools=…
     field) measurably improves tool-call rates."""
@@ -261,7 +303,13 @@ def _build_system_prompt(tool_schemas: list[dict]) -> str:
             desc = (fn.get("description") or "").strip().split("\n")[0][:120]
             lines.append(f"  • {name} — {desc}")
         tool_list = "\n".join(lines)
-    return SYSTEM_PROMPT_TEMPLATE.format(tool_list=tool_list)
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(tool_list=tool_list)
+    if agent is not None and not agent.is_default:
+        prompt += f"\nYou are acting as the user's agent \"{agent.name}\""
+        prompt += f" ({agent.role}).\n" if agent.role else ".\n"
+    if agent is not None and agent.instructions:
+        prompt += "\nThe user's standing instructions for this agent:\n" + agent.instructions + "\n"
+    return prompt
 
 
 async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
@@ -277,12 +325,21 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
         try:
             await _update_task_status(db, task_id, status="running")
 
-            tool_schemas = await _allowed_tool_schemas(db, user_id)
+            task_row = (await db.execute(
+                select(BackgroundTask).where(BackgroundTask.id == task_id)
+            )).scalar_one_or_none()
+            agent = await _load_agent(db, user_id, task_row.agent_id if task_row else None)
+            policy = _effective_policy(agent)
+            connected_schemas = await _allowed_tool_schemas(db, user_id)
+            tool_schemas = [
+                s for s in connected_schemas + WAIT_TOOL_SCHEMAS
+                if policy.get(s.get("function", {}).get("name")) != "deny"
+            ]
 
             # If the user hasn't connected any data providers, fail
             # immediately with a clear message rather than let the LLM
             # hallucinate / refuse a useless answer.
-            if not tool_schemas:
+            if not connected_schemas:
                 msg = (
                     "You haven't connected any data providers yet. "
                     "Open **Settings → Connectors** and connect Google (Gmail + Calendar + Drive) "
@@ -312,12 +369,15 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
             )).scalar_one_or_none()
             cp = (row.checkpoint if row is not None else None) or {}
             messages: list[dict] = cp.get("messages") or [
-                {"role": "system", "content": _build_system_prompt(tool_schemas)},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": _build_system_prompt(tool_schemas, agent)},
+                {"role": "user", "content": _with_context(prompt, task_row.desktop_context if task_row else None)},
             ]
             start_turn = int(cp.get("turn") or 0)
 
-            base_url, api_key = _llm_base_and_key(DEFAULT_PROVIDER)
+            provider, model = model_gateway.resolve(
+                "task_planner", (agent.model_policy or {}).get("task_planner") if agent else None,
+            )
+            base_url, api_key = _llm_base_and_key(provider)
             http = get_http()
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -343,7 +403,7 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
                     tool_calls = last["tool_calls"]
                 else:
                     payload: dict[str, Any] = {
-                        "model": DEFAULT_MODEL,
+                        "model": model,
                         "messages": messages,
                         "temperature": 0.2,
                     }
@@ -404,6 +464,8 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
                 # once, real worker decomposition later). Destructive ones
                 # serialize through the approval gate so we don't surprise-
                 # send 4 emails before the user can blink.
+                waits: list[dict] = []  # wait tools called this turn (events.py)
+
                 async def _execute_one(tc: dict) -> dict:
                     tc_id = tc.get("id") or _ulid()
                     fn = tc.get("function") or {}
@@ -414,7 +476,7 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
                     except Exception:
                         args = {}
 
-                    if name not in ALL_ALLOWED_TOOLS:
+                    if name not in ALL_ALLOWED_TOOLS or policy.get(name) == "deny":
                         await _append_event(db, task_id, "tool_call", {
                             "id": tc_id, "name": name, "args": args, "rejected": True,
                         })
@@ -423,13 +485,26 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
                             "content": f"Tool {name!r} is not available in background tasks.",
                         }
 
-                    # Destructive → park for user approval before executing.
-                    if name in DESTRUCTIVE_TOOLS:
-                        await _append_event(db, task_id, "approval_needed", {
-                            "id": tc_id, "name": name, "args": args,
-                            "summary": _summarize_destructive(name, args),
-                        })
-                        await db.commit()
+                    if name in WAIT_TOOLS:
+                        wait, msg = build_wait(name, args)
+                        await _append_event(db, task_id, "tool_call", {"id": tc_id, "name": name, "args": args})
+                        if wait is not None:
+                            waits.append(wait)
+                        return {"tool_call_id": tc_id, "content": msg}
+
+                    # Destructive (or agent-policy-gated) → park for approval.
+                    # An agent policy of "allow" pre-approves it, but it still
+                    # goes through task_approvals so a resume can't re-run it.
+                    gated = name in DESTRUCTIVE_TOOLS or policy.get(name) == "require_approval"
+                    if gated:
+                        if policy.get(name) == "allow":
+                            await _auto_approve(task_id, tc_id, name)
+                        else:
+                            await _append_event(db, task_id, "approval_needed", {
+                                "id": tc_id, "name": name, "args": args,
+                                "summary": _summarize_destructive(name, args),
+                            })
+                            await db.commit()
                         decision, edited_args, stored = await _park_for_approval(
                             task_id, tc_id, name, APPROVAL_TIMEOUT_S,
                         )
@@ -479,7 +554,7 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
                             else:
                                 result_str = f"tool exception: {raw[:500]}"
 
-                    if name in DESTRUCTIVE_TOOLS:
+                    if gated:
                         await _mark_executed(task_id, tc_id, result_str or "")
                     await _append_event(db, task_id, "tool_result", {
                         "id": tc_id, "name": name, "ok": ok,
@@ -498,6 +573,13 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
                     messages.append({"role": "tool", "tool_call_id": tr["tool_call_id"], "content": tr["content"]})
                 await db.commit()
                 await _save_checkpoint(db, task_id, messages, turn + 1)
+                if waits:
+                    # Park: no compute until events.watcher_loop wakes us.
+                    await db.execute(update(BackgroundTask).where(BackgroundTask.id == task_id)
+                                     .values(waiting_for=waits[0]))
+                    await _append_event(db, task_id, "step_start", {"step": "waiting", "waiting_for": waits[0]})
+                    await db.commit()
+                    return
             else:
                 # Hit MAX_TASK_TURNS without an assistant final response.
                 final_text = "Reached the maximum turn limit without producing a summary."
@@ -527,6 +609,17 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
 
 class TaskCreateRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=4000)
+    agent_id: str | None = None  # omit to let the router pick
+    desktop_context: dict[str, str] | None = None  # from the engine (Phase 4)
+
+    @field_validator("desktop_context")
+    @classmethod
+    def _small_context(cls, v):
+        if v is None:
+            return v
+        allowed = {"app", "window_title", "url", "selected_text"}
+        v = {k: str(val)[:2000] for k, val in v.items() if k in allowed and val}
+        return v or None
 
 
 async def tasks_create(
@@ -538,16 +631,25 @@ async def tasks_create(
     check_burst(user.id, "background_task", per_hour=BURST_PER_HOUR, per_day=BURST_PER_DAY)
     await check_and_increment(db, user, "command")
 
+    import agents as _agents
+    if body.agent_id:
+        agent = await _agents.get_user_agent(db, user.id, body.agent_id)
+        routed = {"agent_id": agent.id, "agent_name": agent.name}
+    else:
+        routed = await _agents.route_utterance(db, user.id, body.prompt)
+
     task_id = _ulid()
     db.add(BackgroundTask(
         id=task_id, user_id=user.id, prompt=body.prompt.strip(), status="queued",
+        agent_id=routed["agent_id"], desktop_context=body.desktop_context,
     ))
     await db.commit()
 
     # task_runtime's worker leases and runs it (survives restarts).
     import task_runtime
     task_runtime.wake()
-    return {"id": task_id, "status": "queued"}
+    return {"id": task_id, "status": "queued",
+            "agent_id": routed["agent_id"], "agent_name": routed["agent_name"]}
 
 
 async def tasks_list(
@@ -555,6 +657,8 @@ async def tasks_list(
     user: User = Depends(current_user),
 ):
     """Most recent 50 tasks for the caller."""
+    import agents as _agents
+    names = {a.id: a.name for a in await _agents.user_agents(db, user.id)}
     rows = (await db.execute(
         select(BackgroundTask).where(BackgroundTask.user_id == user.id)
         .order_by(desc(BackgroundTask.created_at)).limit(50)
@@ -564,7 +668,10 @@ async def tasks_list(
             {
                 "id": r.id,
                 "prompt": r.prompt,
+                "agent_id": r.agent_id,
+                "agent_name": names.get(r.agent_id),
                 "status": r.status,
+                "waiting": r.waiting_for is not None,
                 "result_md": r.result_md,
                 "error": r.error,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
@@ -581,6 +688,8 @@ async def tasks_get(
     user: User = Depends(current_user),
 ):
     """Single task + full event log."""
+    import agents as _agents
+    names = {a.id: a.name for a in await _agents.user_agents(db, user.id)}
     task = (await db.execute(
         select(BackgroundTask).where(
             BackgroundTask.id == task_id, BackgroundTask.user_id == user.id,
@@ -595,7 +704,10 @@ async def tasks_get(
     return {
         "id": task.id,
         "prompt": task.prompt,
+        "agent_id": task.agent_id,
+        "agent_name": names.get(task.agent_id),
         "status": task.status,
+        "waiting_for": task.waiting_for,
         "result_md": task.result_md,
         "error": task.error,
         "created_at": task.created_at.isoformat() if task.created_at else None,
@@ -699,7 +811,8 @@ async def _task_snapshot(db: AsyncSession, user_id: int) -> dict[str, dict]:
     """{task_id: {status, approval_needed, result_preview}} for recent tasks."""
     since = datetime.now(timezone.utc) - timedelta(days=1)
     rows = (await db.execute(
-        select(BackgroundTask.id, BackgroundTask.status, BackgroundTask.result_md, BackgroundTask.prompt)
+        select(BackgroundTask.id, BackgroundTask.status, BackgroundTask.result_md, BackgroundTask.prompt,
+               BackgroundTask.waiting_for)
         .where(BackgroundTask.user_id == user_id, BackgroundTask.created_at >= since)
         .order_by(desc(BackgroundTask.created_at)).limit(50)
     )).all()
@@ -712,6 +825,7 @@ async def _task_snapshot(db: AsyncSession, user_id: int) -> dict[str, dict]:
         r.id: {
             "id": r.id,
             "status": r.status,
+            "waiting": r.waiting_for is not None,
             "approval_needed": r.id in pending,
             "prompt": (r.prompt or "")[:120],
             "result_preview": (r.result_md or "")[:200],
@@ -725,7 +839,8 @@ def _snapshot_changes(old: dict[str, dict], new: dict[str, dict]) -> list[dict]:
     out = []
     for tid, cur in new.items():
         prev = old.get(tid)
-        if prev is None or prev["status"] != cur["status"] or prev["approval_needed"] != cur["approval_needed"]:
+        if prev is None or prev["status"] != cur["status"] or prev["approval_needed"] != cur["approval_needed"] \
+                or prev["waiting"] != cur["waiting"]:
             out.append(cur)
     return out
 

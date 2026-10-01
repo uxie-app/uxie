@@ -36,6 +36,9 @@ export function Sidebar({ activeTab, onTab, isListening, onSettings }: Props) {
       <div className={`nav-item ${activeTab === "tasks" ? "active" : ""}`} onClick={() => onTab("tasks")}>
         <span className="icon">⚡</span><span>Tasks</span>
       </div>
+      <div className={`nav-item ${activeTab === "agents" ? "active" : ""}`} onClick={() => onTab("agents")}>
+        <span className="icon">◎</span><span>Agents</span>
+      </div>
       <div className={`nav-item ${activeTab === "briefings" ? "active" : ""}`} onClick={() => onTab("briefings")}>
         <span className="icon">☀</span><span>Briefings</span>
       </div>

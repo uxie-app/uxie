@@ -110,7 +110,8 @@ async def execute(name: str, args: dict[str, Any], token: OAuthToken, http: http
                                     {"channel": channel_id, "text": args["text"]})
             if not res.get("ok"):
                 return False, f"Slack rejected: {res.get('error', 'unknown')}"
-            return True, f"Message sent to {args['channel']}."
+            # channel_id + ts let a background task wait_for_slack_reply on it.
+            return True, f"Message sent to {args['channel']} (channel_id: {channel_id}, ts: {res.get('ts', '?')})."
 
         if name == "slack_search":
             res = await _slack_get(http, slack_token, "search.messages",

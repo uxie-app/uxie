@@ -47,14 +47,15 @@ sequence is in `PROGRESS.md` → "Up next".
 
 ## 5. Baseline test status
 
-Known failures that were already failing before the roadmap work started. New
-work must not add to these. Fix them in their own unit.
+All suites are green as of 2026-09-30. New work must keep them green.
 
 | Suite | Command | Baseline |
 |---|---|---|
-| Backend | `cd uxie-backend && pytest` | 1 failing: `test_auth.py::test_health` (stale assertion); 41 passing, 3 skipped |
-| Engine | `cd miniflow-engine && pytest` | 12 failing; 36 passing |
-| Desktop unit | `cd miniflow-electron && npx jest` | 9 failing; 13 passing |
+| Backend | `cd uxie-backend && pytest` | all green: 58 passed, 3 skipped |
+| Engine | `cd miniflow-engine && pytest` (own venv; not shared with the backend) | all green: 51 passed |
+| Desktop unit | `cd miniflow-electron && npx jest` | all green: 24 passed |
 | Desktop types | `npx tsc --noEmit -p tsconfig.json` and `-p tsconfig.main.json` | clean |
+
+CI (`.github/workflows/test.yml`) runs all of these on every PR and on pushes to `main`/`staging`. From now on, a red suite blocks merging.
 
 Update this table whenever a unit changes the baseline.

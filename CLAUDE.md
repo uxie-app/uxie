@@ -61,6 +61,12 @@ build_backend.sh           PyInstaller-only build
 - Source: `uxie-backend/` directory
 - Required env vars: `DEEPGRAM_API_KEY`, `GROQ_API_KEY`, `OPENAI_API_KEY`, `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `RESEND_API_KEY`, `DATABASE_URL`
 
+## Backend schema, agents, models
+- Schema changes go in Alembic revisions: `uxie-backend/migrations/versions/`. `init_db()` runs `upgrade head` at startup under a Postgres advisory lock. Revisions after `0001_baseline` must be existence-guarded. Don't add columns to `db.ADDITIVE_COLUMNS` (frozen).
+- Background tasks run under an agent (`uxie-backend/agents.py`): per-tool policy allow | require_approval | deny, and `/route` picks the agent.
+- LLM model choice goes through `uxie-backend/model_gateway.py` roles. Override with the env var `MODEL_ROLE_<ROLE>="provider:model"`.
+- Background tasks can park on a reply or a time (`uxie-backend/events.py`). The watcher wakes them. Parked tasks keep `status="running"` and have `waiting_for` set.
+
 ## Key files
 - `miniflow-engine/audio.py` — STT pipeline (Deepgram WebSocket)
 - `miniflow-engine/agent.py` — LLM agent loop, grammar correction

@@ -14,7 +14,7 @@ import secrets
 import string
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -158,9 +158,8 @@ async def get_db():
         yield session
 
 
-# create_all never alters existing tables, so columns added to a model after
-# its table exists in prod are listed here. Additive + nullable only, so the
-# previous deploy keeps working during a rolling deploy.
+# FROZEN — part of migrations/versions/0001_baseline. New schema changes go
+# in a new Alembic revision (migrations/versions/), not here.
 ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("otps", "attempts", "INTEGER DEFAULT 0"),
     ("background_tasks", "lease_owner", "VARCHAR"),
@@ -170,11 +169,22 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
 ]
 
 
+def run_migrations(sync_conn) -> None:
+    """Alembic `upgrade head` on an open connection (see migrations/env.py)."""
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    here = Path(__file__).resolve().parent
+    cfg = Config(str(here / "alembic.ini"))
+    cfg.set_main_option("script_location", str(here / "migrations"))
+    cfg.attributes["connection"] = sync_conn
+    command.upgrade(cfg, "head")
+
+
 async def init_db():
+    import db_ios  # noqa: F401 — every model must be registered before migrating
+
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        if conn.dialect.name == "postgresql":
-            for table, column, ddl in ADDITIVE_COLUMNS:
-                await conn.execute(text(
-                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl}"
-                ))
+        await conn.run_sync(run_migrations)

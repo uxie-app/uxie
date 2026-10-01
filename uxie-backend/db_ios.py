@@ -104,6 +104,33 @@ class BackgroundTask(Base):
     lease_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     attempt = Column(Integer, nullable=True, default=0)
     checkpoint = Column(JSON, nullable=True)  # {"messages": [...], "turn": int}
+    agent_id = Column(String, nullable=True)  # agents.id (migration 0002)
+    # Set while the task is parked on an event or time (events.py); status
+    # stays "running" so older clients don't see an unknown state. (0003)
+    waiting_for = Column(JSON, nullable=True)
+    # What the user was looking at when they asked (app, window_title, url,
+    # selected_text), captured at hotkey press by the engine. (0004)
+    desktop_context = Column(JSON, nullable=True)
+
+
+class Agent(Base):
+    """A persistent, user-visible agent (Phase 2). Every user gets a default
+    "Uxie" agent on first use (agents.ensure_default_agent). `tool_policy`
+    maps tool name → allow | require_approval | deny; tools not listed fall
+    back to the built-in defaults in tasks.py. Created by migration 0002."""
+    __tablename__ = "agents"
+
+    id = Column(String, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(64), nullable=False)
+    role = Column(Text, nullable=True)
+    instructions = Column(Text, nullable=True)
+    icon = Column(String(16), nullable=True)
+    is_default = Column(Boolean, nullable=False, default=False)
+    tool_policy = Column(JSON, nullable=True)
+    model_policy = Column(JSON, nullable=True)  # {"task_planner": "<model>"} overrides
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_now)
 
 
 class TaskApproval(Base):

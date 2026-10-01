@@ -339,6 +339,7 @@ function AccountTab() {
   const [copied, setCopied] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [shareAdmin, setShareAdmin] = useState<boolean | null>(null);
+  const [desktopContext, setDesktopContext] = useState<boolean | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -347,6 +348,12 @@ function AccountTab() {
         setShareAdmin(Boolean(r?.enabled));
       } catch {
         setShareAdmin(false);
+      }
+      try {
+        const c = await (window.miniflow as any).getDesktopContextEnabled?.();
+        setDesktopContext(c?.enabled !== false);
+      } catch {
+        setDesktopContext(null);
       }
     })();
   }, []);
@@ -366,6 +373,16 @@ function AccountTab() {
       setShareAdmin(next);
     } catch (e) {
       console.error("[settings] toggle share-admin failed:", e);
+    }
+  }
+
+  async function toggleDesktopContext() {
+    if (desktopContext === null) return;
+    try {
+      await (window.miniflow as any).setDesktopContextEnabled(!desktopContext);
+      setDesktopContext(!desktopContext);
+    } catch (e) {
+      console.error("[settings] toggle desktop context failed:", e);
     }
   }
 
@@ -451,6 +468,33 @@ function AccountTab() {
             </code>
             <button className="btn-secondary" onClick={copyLink} style={{ whiteSpace: "nowrap" }}>
               {copied ? "✓ Copied" : "Copy"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {desktopContext !== null && (
+        <div className="field" style={{ marginTop: 8, paddingTop: 16, borderTop: "1px solid var(--fn-card-border)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 16 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text-primary)" }}>
+                Use what's on screen for commands
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4, lineHeight: 1.5 }}>
+                When you press the command hotkey, Uxie sends the active app, window title, browser URL and
+                selected text with your request so "handle this" works. Only captured at that moment, never continuously.
+              </div>
+            </div>
+            <button
+              onClick={toggleDesktopContext}
+              style={{
+                padding: "4px 12px", borderRadius: 12, border: "1px solid #ccc",
+                background: desktopContext ? "#1a1a1a" : "transparent",
+                color: desktopContext ? "#fff" : "#1a1a1a",
+                fontWeight: 600, fontSize: 12, cursor: "pointer", minWidth: 56,
+              }}
+            >
+              {desktopContext ? "ON" : "OFF"}
             </button>
           </div>
         </div>

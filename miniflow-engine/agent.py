@@ -108,6 +108,7 @@ def resolve_approval(approved: bool, edited_params: dict | None = None):
     if _approval_event:
         _approval_event.set()
 _selected_text: str = ""  # captured at session start for transform commands
+_window_title: str = ""   # captured at session start (desktop context, Phase 4)
 
 TRANSFORM_KEYWORDS = {
     "polish", "polished", "fix", "clean", "cleanup",
@@ -149,10 +150,67 @@ def set_target_app(bundle_id: str | None):
 def capture_selected_text():
     """Read the current text selection from the frontmost app via the Accessibility API.
     Called at session start (before Waves connects) so we have it ready for transform commands."""
-    global _selected_text
+    global _selected_text, _window_title
     _selected_text = _read_selected_text()
+    _window_title = _read_window_title()
     if _selected_text:
         log.info(f"Captured selected text ({len(_selected_text)} chars)")
+
+
+def _read_window_title() -> str:
+    """Title of the focused window in the frontmost app ("" if unavailable)."""
+    try:
+        if _IS_WIN:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            n = user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            return buf.value.strip()
+        import AppKit
+        from ApplicationServices import (
+            AXUIElementCreateApplication,
+            AXUIElementCopyAttributeValue,
+            kAXErrorSuccess,
+        )
+        front_app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        if not front_app:
+            return ""
+        app_ref = AXUIElementCreateApplication(front_app.processIdentifier())
+        err, window = AXUIElementCopyAttributeValue(app_ref, "AXFocusedWindow", None)
+        if err != kAXErrorSuccess or not window:
+            return ""
+        err, title = AXUIElementCopyAttributeValue(window, "AXTitle", None)
+        return str(title).strip() if err == kAXErrorSuccess and title else ""
+    except Exception as e:
+        log.debug(f"_read_window_title: {e}")
+        return ""
+
+
+MAX_CONTEXT_SELECTION = 2000
+
+
+def desktop_context() -> dict:
+    """What the user was looking at when they pressed the hotkey. Captured
+    on demand only (never continuously). Empty fields are dropped."""
+    if not config.get_desktop_context_enabled():
+        return {}
+    ctx = {
+        "app": _target_bundle_id,
+        "window_title": _window_title,
+        "url": _target_page_url,
+        "selected_text": (_selected_text or "")[:MAX_CONTEXT_SELECTION],
+    }
+    return {k: v for k, v in ctx.items() if v}
+
+
+def _context_block(ctx: dict) -> str:
+    if not ctx:
+        return ""
+    labels = [("app", "App"), ("window_title", "Window"), ("url", "URL"), ("selected_text", "Selected text")]
+    lines = [f"{label}: {ctx[k]}" for k, label in labels if ctx.get(k)]
+    return "[Desktop context when the user spoke — use it to resolve 'this', 'here', 'that']\n" + "\n".join(lines) + "\n"
 
 
 def _read_selected_text() -> str:
@@ -381,7 +439,7 @@ async def _start_background_task(goal: str) -> tuple[bool, str]:
             r = await client.post(
                 f"{config.get_uxie_backend_url()}/tasks/create",
                 headers={"Authorization": f"Bearer {jwt}"},
-                json={"prompt": goal[:4000]},
+                json={"prompt": goal[:4000], "desktop_context": desktop_context() or None},
             )
         if r.status_code == 429:
             return False, "Background task limit reached — try again later."
@@ -969,6 +1027,9 @@ async def execute_command(text: str) -> list[dict]:
         user_msg = f"[User name: {user_name}]\n[Today: {today}]\n{user_msg}"
     else:
         user_msg = f"[Today: {today}]\n{user_msg}"
+    ctx_block = _context_block(desktop_context())
+    if ctx_block:
+        user_msg = ctx_block + user_msg
 
     messages: list[dict] = [
         {"role": "system", "content": SYSTEM_PROMPT},

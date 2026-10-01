@@ -76,11 +76,14 @@ async def lifespan(app: FastAPI):
     # whose worker died (task_runtime.py).
     import task_runtime as _runtime
     task_worker = __import__("asyncio").create_task(_runtime.worker_loop())
+    # Wakes tasks parked on a reply or a time (events.py).
+    import events as _events
+    event_watcher = __import__("asyncio").create_task(_events.watcher_loop())
 
     try:
         yield
     finally:
-        for bg in (cron_task, task_worker):
+        for bg in (cron_task, task_worker, event_watcher):
             bg.cancel()
             try:
                 await bg
@@ -293,6 +296,14 @@ app.add_api_route("/user/connector_token/{provider}", _connector_token, methods=
 # /tasks/* — background agent tasks (v1.1.0). Detached from the HTTP
 # request; client polls /tasks/{id} for progress.
 import tasks as _tasks  # noqa: E402
+# /agents + /route — persistent agents (Phase 2)
+import agents as _agents  # noqa: E402
+app.add_api_route("/agents",            _agents.agents_list,   methods=["GET"])
+app.add_api_route("/agents",            _agents.agents_create, methods=["POST"])
+app.add_api_route("/agents/{agent_id}", _agents.agents_update, methods=["PATCH"])
+app.add_api_route("/agents/{agent_id}", _agents.agents_delete, methods=["DELETE"])
+app.add_api_route("/route",             _agents.route,         methods=["POST"])
+
 app.add_api_route("/tasks/create",      _tasks.tasks_create, methods=["POST"])
 app.add_api_route("/tasks",             _tasks.tasks_list,   methods=["GET"])
 app.add_api_route("/tasks/stream",      _tasks.tasks_stream, methods=["GET"])  # before /tasks/{task_id}

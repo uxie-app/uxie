@@ -183,6 +183,19 @@ def set_share_meetings_with_admin(enabled: bool) -> None:
     _write_settings(s)
 
 
+def get_desktop_context_enabled() -> bool:
+    """When true, command-mode invocations attach what the user was looking
+    at (app, window title, browser URL, selection) — captured only at hotkey
+    press, never continuously. Default on; the user can turn it off."""
+    return bool(_read_settings().get("desktop_context_enabled", True))
+
+
+def set_desktop_context_enabled(enabled: bool) -> None:
+    s = _read_settings()
+    s["desktop_context_enabled"] = bool(enabled)
+    _write_settings(s)
+
+
 def save_user_name(name: str):
     s = _read_settings()
     s["user_name"] = name.strip() or None

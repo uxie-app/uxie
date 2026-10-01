@@ -39,8 +39,8 @@ describe("HelperManager.dispatch", () => {
     const onPress = jest.fn();
     h.on("press", onPress);
     h.start();
-    proc.stdout.emit("data", Buffer.from('{"press":true}\n'));
-    expect(onPress).toHaveBeenCalledTimes(1);
+    proc.stdout.emit("data", Buffer.from('{"type":"press","mode":"dictation"}\n'));
+    expect(onPress).toHaveBeenCalledWith("dictation");
   });
 
   it("emits 'release' on release event", () => {
@@ -50,8 +50,8 @@ describe("HelperManager.dispatch", () => {
     const onRelease = jest.fn();
     h.on("release", onRelease);
     h.start();
-    proc.stdout.emit("data", Buffer.from('{"release":true}\n'));
-    expect(onRelease).toHaveBeenCalledTimes(1);
+    proc.stdout.emit("data", Buffer.from('{"type":"release","mode":"command"}\n'));
+    expect(onRelease).toHaveBeenCalledWith("command");
   });
 
   it("emits 'toggle' with on/off", () => {
@@ -61,10 +61,10 @@ describe("HelperManager.dispatch", () => {
     const onToggle = jest.fn();
     h.on("toggle", onToggle);
     h.start();
-    proc.stdout.emit("data", Buffer.from('{"toggle":true,"on":true}\n'));
-    proc.stdout.emit("data", Buffer.from('{"toggle":true,"on":false}\n'));
-    expect(onToggle).toHaveBeenNthCalledWith(1, true);
-    expect(onToggle).toHaveBeenNthCalledWith(2, false);
+    proc.stdout.emit("data", Buffer.from('{"type":"toggle","mode":"command","on":true}\n'));
+    proc.stdout.emit("data", Buffer.from('{"type":"toggle","mode":"command","on":false}\n'));
+    expect(onToggle).toHaveBeenNthCalledWith(1, "command", true);
+    expect(onToggle).toHaveBeenNthCalledWith(2, "command", false);
   });
 
   it("handles partial lines (buffered correctly)", () => {
@@ -74,9 +74,9 @@ describe("HelperManager.dispatch", () => {
     const onPress = jest.fn();
     h.on("press", onPress);
     h.start();
-    proc.stdout.emit("data", Buffer.from('{"pre'));
+    proc.stdout.emit("data", Buffer.from('{"type":"pre'));
     expect(onPress).not.toHaveBeenCalled();
-    proc.stdout.emit("data", Buffer.from('ss":true}\n'));
+    proc.stdout.emit("data", Buffer.from('ss","mode":"dictation"}\n'));
     expect(onPress).toHaveBeenCalledTimes(1);
   });
 
