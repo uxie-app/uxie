@@ -29,14 +29,14 @@ describe("AgentsTab", () => {
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Research" } });
     fireEvent.click(screen.getByText("Create agent"));
     await waitFor(() => expect(api.createAgent).toHaveBeenCalledWith({ name: "Research", role: null }));
-    await screen.findByText("Research");
+    await screen.findByText("Research", { selector: "h2" });
   });
 
   it("saves a per-tool policy", async () => {
     const api = installMockApi();
     render(<AgentsTab />);
-    fireEvent.click(await screen.findByText("Edit"));
-    fireEvent.change(screen.getByDisplayValue(/Default \(Ask me\)/), { target: { value: "deny" } });
+    fireEvent.click(await screen.findByText("Uxie"));
+    fireEvent.change(await screen.findByLabelText("Send email"), { target: { value: "deny" } });
     fireEvent.click(screen.getByText("Save"));
     await waitFor(() => expect(api.updateAgent).toHaveBeenCalledWith("a0", { instructions: null, tool_policy: { gmail_send: "deny" } }));
   });

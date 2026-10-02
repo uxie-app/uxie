@@ -5,7 +5,8 @@ type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 type TaskEvent = {
   seq: number;
   kind: "step_start" | "tool_call" | "tool_result" | "thinking" | "final_text" | "error"
-      | "approval_needed" | "approval_resolved";
+      | "approval_needed" | "approval_resolved"
+      | "computer_session" | "computer_actions" | "computer_takeover" | "computer_done" | "computer_result";
   data: any;
   created_at: string;
 };
@@ -16,6 +17,8 @@ type Task = {
   status: TaskStatus;
   agent_name?: string | null;
   waiting?: boolean;
+  waiting_for?: { type?: string; thread_id?: string; wake_at?: string } | null;
+  approval_needed?: boolean;
   result_md: string | null;
   error: string | null;
   created_at: string;
@@ -30,18 +33,38 @@ const STATUS_COLORS: Record<TaskStatus, string> = {
   running:   "#3367d6",
   completed: "#3a8c6a",
   failed:    "#d44a4a",
-  cancelled: "#999",
+  cancelled: "#5b6878",
 };
 
-function StatusPill({ status }: { status: TaskStatus }) {
-  const color = STATUS_COLORS[status] ?? "#888";
+// What the user should see: "needs you" beats "running"; a parked task is
+// still status=running on the server but reads as waiting.
+function displayStatus(t: Task): { label: string; color: string } {
+  if (t.approval_needed && !["completed", "failed", "cancelled"].includes(t.status)) {
+    return { label: "needs you", color: "#F4A21B" };
+  }
+  if (t.waiting) return { label: "waiting", color: "#5b6878" };
+  return { label: t.status, color: STATUS_COLORS[t.status] ?? "#888" };
+}
+
+function waitingText(w: Task["waiting_for"]): string {
+  if (!w) return "";
+  if (w.type === "gmail_reply") return "waiting for an email reply";
+  if (w.type === "slack_reply") return "waiting for a Slack reply";
+  if (w.type === "time" && w.wake_at) {
+    return `waiting until ${new Date(w.wake_at).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}`;
+  }
+  return "waiting";
+}
+
+function StatusPill({ task }: { task: Task }) {
+  const { label, color } = displayStatus(task);
   return (
     <span style={{
       fontSize: 11, padding: "2px 8px", borderRadius: 10,
       background: color + "22", color, fontWeight: 600,
-      textTransform: "uppercase", letterSpacing: 0.04,
+      textTransform: "uppercase", letterSpacing: 0.04, whiteSpace: "nowrap",
     }}>
-      {status}
+      {label}
     </span>
   );
 }
@@ -184,7 +207,7 @@ function TaskList({
           <div style={{ marginTop: 8, color: "#d44a4a", fontSize: 11 }}>{error}</div>
         )}
         <div style={{ marginTop: 12, fontSize: 11, color: "#888", lineHeight: 1.4 }}>
-          v1.1 supports read-only tasks (search Gmail / Calendar / Drive). Sending and creating actions land in the next release.
+          Runs on Uxie's servers and keeps going when your Mac sleeps. Anything that sends, posts or buys asks you first.
         </div>
       </div>
       <hr style={{ border: "none", borderTop: "1px solid #e5e3df", margin: "0 16px" }} />
@@ -214,9 +237,9 @@ function TaskList({
               {t.prompt}
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <StatusPill status={t.status} />
+              <StatusPill task={t} />
               <span style={{ fontSize: 11, color: "#888" }}>
-                {t.agent_name ? `${t.agent_name} · ` : ""}{t.waiting ? "Waiting · " : ""}{formatRelative(t.created_at)}
+                {t.agent_name ? `${t.agent_name} · ` : ""}{formatRelative(t.created_at)}
               </span>
             </div>
           </button>
@@ -236,7 +259,6 @@ function EmptyDetail() {
 
 function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => void }) {
   const [task, setTask] = useState<Task | null>(null);
-  const [polling, setPolling] = useState(false);
   const pollTimer = useRef<number | null>(null);
 
   const fetchOnce = useCallback(async () => {
@@ -248,7 +270,6 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
   // Initial fetch + adaptive polling.
   useEffect(() => {
     let cancelled = false;
-    setPolling(true);
 
     async function loop() {
       while (!cancelled) {
@@ -256,7 +277,6 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
         const status = r?.status;
         if (cancelled) return;
         if (status === "completed" || status === "failed" || status === "cancelled") {
-          setPolling(false);
           return;
         }
         // Active task: poll every 2s. Refresh the parent list too so the
@@ -294,10 +314,11 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
         <div style={{ flex: 1 }}>
           <h2 style={{ fontSize: 18, marginBottom: 6 }}>{task.prompt}</h2>
           <div style={{ fontSize: 12, color: "#666" }}>
-            {formatRelative(task.created_at)} · {polling && "polling…"}
+            {[task.agent_name, `started ${formatRelative(task.created_at)}`, task.waiting ? waitingText(task.waiting_for) : ""]
+              .filter(Boolean).join(" · ")}
           </div>
         </div>
-        <StatusPill status={task.status} />
+        <StatusPill task={task} />
       </header>
 
       {!isTerminal && (
@@ -312,6 +333,8 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
           {task.error}
         </div>
       )}
+
+      <ComputerPanel task={task} onResolved={() => fetchOnce().then(() => onChanged())} />
 
       {task.result_md && (
         <section style={{ marginTop: 24 }}>
@@ -337,6 +360,69 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
         </section>
       )}
     </div>
+  );
+}
+
+// Live view of a task's cloud computer (computer_use.py). Shown while the
+// session is active; "Take over" opens the interactive stream in the browser.
+function ComputerPanel({ task, onResolved }: { task: Task; onResolved: () => void }) {
+  const events = task.events ?? [];
+  const session = [...events].reverse().find(e => e.kind === "computer_session");
+  if (!session) return null;
+  const callId = session.data?.call_id;
+  const done = events.some(e => (e.kind === "computer_result" || e.kind === "computer_done")
+    && e.data?.call_id === callId && e.seq > session.seq);
+  const active = !done && !["completed", "failed", "cancelled"].includes(task.status);
+  const takeover = [...events].reverse().find(e => e.kind === "approval_needed"
+    && e.data?.name === "computer_takeover" && isPendingApproval(events, e));
+
+  return (
+    <section style={{ marginTop: 24 }}>
+      <h3 style={sectionLabel}>Computer</h3>
+      <div style={{ padding: 16, borderRadius: 8, border: "1px solid #e5e3df", background: "rgba(255,255,255,0.6)" }}>
+        <div style={{ fontSize: 12, color: "#666", marginBottom: 12 }}>{session.data?.goal}</div>
+        {active ? (
+          <>
+            {takeover && (
+              <div style={{
+                fontSize: 13, padding: 12, borderRadius: 8, marginBottom: 12,
+                background: "rgba(244, 162, 27, 0.08)", border: "1px solid rgba(244, 162, 27, 0.4)",
+              }}>
+                {takeover.data?.summary?.replace(/^Take over: /, "") || "Uxie needs you to take over."}
+              </div>
+            )}
+            <div style={{
+              position: "relative", width: "100%", aspectRatio: "16 / 10", borderRadius: 6, overflow: "hidden",
+              border: "1px solid rgba(0,0,0,0.06)", background: "rgba(0,0,0,0.04)",
+            }}>
+              <iframe
+                title="Live view of the agent's computer"
+                src={session.data?.view_url}
+                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", border: "none" }}
+              />
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <button style={btnPrimary} onClick={() => w.miniflow.openExternal(session.data?.control_url)}>
+                Take over
+              </button>
+              {takeover && (
+                <button style={btnSecondary} onClick={async () => {
+                  await w.miniflow.approveTask(task.id, takeover.data?.id, true, null);
+                  onResolved();
+                }}>
+                  I'm done — continue
+                </button>
+              )}
+            </div>
+            <div style={{ fontSize: 11, color: "#888", marginTop: 8 }}>
+              Take over opens the computer in your browser so you can sign in or finish a step yourself.
+            </div>
+          </>
+        ) : (
+          <div style={{ fontSize: 12, color: "#888" }}>Session ended. The computer was shut down.</div>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -390,6 +476,30 @@ function EventRow({
   }
 
   switch (ev.kind) {
+    case "computer_actions": {
+      const acts: any[] = ev.data?.actions ?? [];
+      return (
+        <div style={baseStyle}>
+          <span style={{ color: "#7a5cd1", textTransform: "uppercase", fontSize: 10, letterSpacing: 0.05 }}>
+            COMPUTER
+          </span>{" "}
+          <span style={{ color: "#666" }}>{acts.map(a => a.action.replace(/_/g, " ")).join(" → ")}</span>
+        </div>
+      );
+    }
+    case "computer_session":
+      return (
+        <div style={baseStyle}>
+          <span style={{ color: "#888", textTransform: "uppercase", fontSize: 10, letterSpacing: 0.05 }}>
+            STEP
+          </span>{" "}
+          {ev.data?.resumed ? "reconnected to cloud computer" : "started a cloud computer"}
+        </div>
+      );
+    case "computer_takeover":
+    case "computer_done":
+    case "computer_result":
+      return null; // surfaced in the Computer panel / Result section
     case "step_start":
       return (
         <div style={baseStyle}>
@@ -537,11 +647,11 @@ function ApprovalRow({
           <button onClick={() => decide(true)} disabled={busy} style={{
             padding: "6px 14px", borderRadius: 6, border: "none",
             background: "#1a1a1a", color: "#fff", fontWeight: 600, fontSize: 12, cursor: "pointer",
-          }}>Approve</button>
+          }}>{ev.data?.name === "computer_takeover" ? "I'm done" : "Approve"}</button>
           <button onClick={() => decide(false)} disabled={busy} style={{
             padding: "6px 14px", borderRadius: 6, border: "1px solid #ccc",
             background: "transparent", fontSize: 12, cursor: "pointer",
-          }}>Decline</button>
+          }}>{ev.data?.name === "computer_takeover" ? "Stop" : "Decline"}</button>
         </div>
       )}
       {error && (
@@ -551,6 +661,11 @@ function ApprovalRow({
   );
 }
 
+
+const btnPrimary: React.CSSProperties = {
+  padding: "8px 14px", borderRadius: 6, border: "none",
+  background: "#1a1a1a", color: "#fff", fontWeight: 600, cursor: "pointer", fontSize: 13,
+};
 
 const btnSecondary: React.CSSProperties = {
   marginTop: 8, padding: "6px 12px", borderRadius: 6,

@@ -207,6 +207,7 @@ const api = {
   onMeetingsReveal:    (cb: () => void) => listen("meetings:reveal", () => cb()),
   onTaskUpdate:        (cb: (t: any) => void) => listen("tasks:update", cb),
   onTasksReveal:       (cb: () => void) => listen("tasks:reveal", () => cb()),
+  onAuthExpired:       (cb: () => void) => listen("auth:expired", () => cb()),
 
   // Dictionary (word → replacement)
   getDictionary:      () => ipcRenderer.invoke("dict:get"),

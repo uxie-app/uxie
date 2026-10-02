@@ -60,6 +60,7 @@ build_backend.sh           PyInstaller-only build
 - URL: `https://uxie-production.up.railway.app`
 - Source: `uxie-backend/` directory
 - Required env vars: `DEEPGRAM_API_KEY`, `GROQ_API_KEY`, `OPENAI_API_KEY`, `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `RESEND_API_KEY`, `DATABASE_URL`
+- Computer use (`uxie-backend/computer_use.py`) needs `E2B_API_KEY` plus the key for the `computer_use` gateway role's provider. The default is OpenAI (`OPENAI_API_KEY`, already set); `MODEL_ROLE_COMPUTER_USE="anthropic:claude-opus-5-5"` switches to Claude, which needs `ANTHROPIC_API_KEY`. Without them the `use_computer` tool isn't offered.
 
 ## Backend schema, agents, models
 - Schema changes go in Alembic revisions: `uxie-backend/migrations/versions/`. `init_db()` runs `upgrade head` at startup under a Postgres advisory lock. Revisions after `0001_baseline` must be existence-guarded. Don't add columns to `db.ADDITIVE_COLUMNS` (frozen).

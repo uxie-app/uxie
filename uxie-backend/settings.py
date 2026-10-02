@@ -18,6 +18,8 @@ class Settings(BaseSettings):
 
     groq_api_key: str = ""
     openai_api_key: str = ""
+    anthropic_api_key: str = ""   # computer use (model_gateway role "computer_use")
+    e2b_api_key: str = ""         # cloud desktops for computer use
     deepgram_api_key: str = ""
 
     # OAuth client credentials per provider. Set via Railway env.

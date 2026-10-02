@@ -130,6 +130,7 @@ manager = ConnectionManager()
 async def lifespan(app: FastAPI):
     log.info("MiniFlow engine starting on http://localhost:8765")
     audio.set_event_broadcaster(manager.broadcast)
+    config.set_auth_expired_callback(lambda: manager.broadcast("auth-expired", {}))
     dictation.set_event_broadcaster(manager.broadcast)
     agent.set_event_broadcaster(manager.broadcast)
     meetings.set_event_emitter(manager.broadcast)
@@ -544,6 +545,8 @@ async def _relay_task_stream() -> None:
                     "GET", f"{config.get_uxie_backend_url()}/tasks/stream",
                     headers={"Authorization": f"Bearer {jwt}"},
                 ) as r:
+                    if r.status_code == 401:
+                        config.report_unauthorized()
                     if r.status_code != 200:
                         raise httpx.HTTPError(f"status {r.status_code}")
                     backoff = 2
@@ -578,6 +581,9 @@ async def _backend_json(method: str, path: str, body: dict | None = None) -> dic
                 method, f"{config.get_uxie_backend_url()}{path}",
                 headers={"Authorization": f"Bearer {jwt}"}, json=body,
             )
+        if r.status_code == 401:
+            config.report_unauthorized()
+            return {"error": "Your Uxie session expired — please sign in again."}
         if r.status_code >= 400:
             try:
                 detail = r.json().get("detail", r.text)
@@ -932,6 +938,10 @@ async def invoke(command: str, body: dict = {}):
             result = await result
         return result
     except Exception as e:
+        import httpx
+        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 401:
+            config.report_unauthorized()
+            return {"error": "Your Uxie session expired — please sign in again."}
         log.error(f"[{command}] {e}")
         return {"error": str(e)}
 

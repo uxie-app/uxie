@@ -26,9 +26,13 @@ ROLE_MODELS: dict[str, tuple[str, str]] = {
     "voice_agent": ("groq", "llama-3.3-70b-versatile"),       # agent.py /agent/* command loop
     "dictation_fix": ("groq", "llama-3.3-70b-versatile"),     # agent.py dictation cleanup
     "briefing": ("openai", "gpt-4o"),                         # scheduled_tasks.py generators
+    # computer_use.py. OpenAI's computer tool by default (user decision,
+    # 2026-10-02); set MODEL_ROLE_COMPUTER_USE="anthropic:claude-opus-5-5"
+    # to switch to Claude's computer toolset.
+    "computer_use": ("openai", "gpt-6.1-sol"),
 }
 
-KNOWN_PROVIDERS = {"openai", "groq"}
+KNOWN_PROVIDERS = {"openai", "groq", "anthropic"}
 
 
 def resolve(role: str, override: str | None = None) -> tuple[str, str]:

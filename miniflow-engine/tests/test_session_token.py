@@ -50,3 +50,33 @@ def test_logout_clears_memory_and_file():
     # A new login after logout goes back to the file until Electron adopts it.
     config.save_jwt("tok4")
     assert _file(config)["access_token"] == "tok4"
+
+
+def test_relogin_while_secured_hands_new_token_to_electron():
+    # Bug repro: old token secured in safeStorage, user signs in again without
+    # signing out — the new token must be offered for adoption, not dropped.
+    import config
+    config.set_session_token("old-expired")
+    config.save_jwt("new-fresh", email="a@b.com")
+    assert config.take_file_token() == {"token": "new-fresh"}
+    assert config.get_jwt() == "new-fresh"
+
+
+def test_report_unauthorized_signs_out_and_notifies():
+    import asyncio
+    import config
+    calls = []
+
+    async def _cb():
+        calls.append(1)
+
+    async def run():
+        config.set_auth_expired_callback(_cb)
+        config.save_jwt("expired-tok", email="a@b.com")
+        config.report_unauthorized()
+        config.report_unauthorized()  # idempotent once signed out
+        await asyncio.sleep(0)
+    asyncio.run(run())
+    assert config.get_jwt() is None
+    assert "access_token" not in config.get_uxie_user()
+    assert calls == [1]

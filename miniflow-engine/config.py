@@ -411,7 +411,11 @@ def save_jwt(
     referral_code: str = "",
     free_days_remaining: int = 30,
 ):
-    global _session_token
+    global _session_token, _token_in_secure_store
+    if token != _session_token:
+        # A new login. Put it on disk for Electron to adopt; otherwise the
+        # next sync would restore the OLD token from safeStorage over it.
+        _token_in_secure_store = False
     _session_token = token
     _ensure_dir()
     data = _read_json(_UXIE_AUTH_FILE, {})
@@ -455,6 +459,29 @@ def clear_jwt():
     _session_token = None
     _token_in_secure_store = False
     _write_json(_UXIE_AUTH_FILE, {})
+
+
+_on_auth_expired = None  # async callback set by main.py (broadcasts to Electron)
+
+
+def set_auth_expired_callback(cb) -> None:
+    global _on_auth_expired
+    _on_auth_expired = cb
+
+
+def report_unauthorized() -> None:
+    """The backend rejected our JWT (expired/revoked). Sign out locally so the
+    app shows sign-in instead of failing every call. Safe to call repeatedly."""
+    if not get_jwt():
+        return
+    log.warning("Uxie session rejected by backend (401) — signing out")
+    clear_jwt()
+    if _on_auth_expired is not None:
+        import asyncio
+        try:
+            asyncio.get_running_loop().create_task(_on_auth_expired())
+        except RuntimeError:
+            pass
 
 
 def get_uxie_user() -> dict:

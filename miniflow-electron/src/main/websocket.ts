@@ -17,7 +17,7 @@ import {
 } from "./widgetState";
 import { showMeetingDetectedNotification } from "./meetingNotifications";
 import { showTaskNotification } from "./taskNotifications";
-import { syncSessionToken } from "./sessionToken";
+import { clearSessionToken, syncSessionToken } from "./sessionToken";
 
 let ws: WebSocket | null = null;
 let getWindows: (() => BrowserWindow[]) = () => [];
@@ -71,6 +71,10 @@ export function connectWs(): void {
       } catch (e) {
         console.error("[meeting] notification failed:", e);
       }
+    }
+
+    if (msg.event === "auth-expired") {
+      clearSessionToken(); // engine already signed out; drop the safeStorage copy
     }
 
     if (msg.event === "task-update") {
@@ -137,6 +141,7 @@ function forwardToRenderer(event: string, payload: unknown): void {
     event === "meeting:transcript-update" ? "meeting:transcript-update" :
     event === "meeting:interim-transcript" ? "meeting:interim-transcript" :
     event === "task-update"         ? "tasks:update" :
+    event === "auth-expired"        ? "auth:expired" :
     null;
   if (!channel) return;
   // Broadcast to every live BrowserWindow exactly ONCE. We used to also loop

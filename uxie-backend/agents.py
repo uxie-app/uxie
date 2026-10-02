@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timezone
 
 from fastapi import Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -109,6 +109,7 @@ def _validate_policy(policy: dict | None) -> dict | None:
 
 
 class AgentCreate(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())  # allow the "model_policy" field
     name: str = Field(..., min_length=1, max_length=64)
     role: str | None = Field(None, max_length=500)
     instructions: str | None = Field(None, max_length=4000)
@@ -118,6 +119,7 @@ class AgentCreate(BaseModel):
 
 
 class AgentUpdate(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())  # allow the "model_policy" field
     name: str | None = Field(None, min_length=1, max_length=64)
     role: str | None = Field(None, max_length=500)
     instructions: str | None = Field(None, max_length=4000)
@@ -131,7 +133,7 @@ async def agents_list(db: AsyncSession = Depends(get_db), user: User = Depends(c
     return {
         "agents": [_serialize(a) for a in await user_agents(db, user.id)],
         # What the policy editor can configure, with each tool's default.
-        "tools": [{"name": t, "default": "allow"} for t in sorted(READ_ONLY_TOOLS)]
+        "tools": [{"name": t, "default": "allow"} for t in sorted(READ_ONLY_TOOLS | {"use_computer"})]
                  + [{"name": t, "default": "require_approval"} for t in sorted(DESTRUCTIVE_TOOLS)],
     }
 

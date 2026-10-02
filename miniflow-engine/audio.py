@@ -138,6 +138,8 @@ async def _get_deepgram_key(force_refresh: bool = False) -> str | None:
                     f"{_config.get_uxie_backend_url()}/stt/session",
                     headers={"Authorization": f"Bearer {jwt}"},
                 )
+                if resp.status_code == 401:
+                    _config.report_unauthorized()
                 resp.raise_for_status()
                 data = resp.json()
             key = data.get("token")

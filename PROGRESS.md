@@ -17,10 +17,67 @@ _(none)_
 
 ## Blocked on user
 
-- Staging is live on `staging` @ `5d9e295` (https://uxie-staging.up.railway.app). The column additions and startup were verified on real Postgres on 2026-09-30. **Remaining:** desktop smoke test against staging (checklist C + D), then merge to `main` and do the desktop release.
-- Decisions D1–D5 (see the roadmap plan).
+- **Turn on computer use (staging):** add `E2B_API_KEY` to Railway → staging → uxie-backend → Variables. OpenAI is now the default provider and `OPENAI_API_KEY` is already set there; no Anthropic key is needed. Without both, the `use_computer` tool is simply not offered.
+- **Smoke test on staging** (desktop checklist, plus agents, wait/reply, "summarize this", and now: "go to news.ycombinator.com and tell me the top 3 stories" → watch it live in Tasks → Computer).
+- **Push + deploy:** this round is uncommitted on `staging` (the one-time push was used). Commit/push yourself, or tell me to.
+- **Decisions (user keeps these):** Gmail Pub/Sub + Slack Events push; desktop-context default ON vs opt-in.
+- After the smoke test: merge `staging` → `main` and cut the Mac + Windows release.
 
 ## Done
+
+### 2026-10-02 — Computer use: OpenAI as the default provider (user decision)
+- The Anthropic account had no credits. The user chose OpenAI.
+- `computer_use.py` is now provider-swappable through the gateway role `computer_use` (default `openai:gpt-6.1-sol`; `MODEL_ROLE_COMPUTER_USE="anthropic:claude-opus-5-5"` switches back). `available()` checks the active provider's key.
+- OpenAI loop (Responses API, tool `{"type":"computer"}`, shapes from the current docs fetched 2026-10-02):
+  - A `computer_call` carries a batch of `actions` (click/double_click/move/drag/scroll/keypress/type/wait/screenshot), and each call is answered with a `computer_call_output` screenshot (`detail: "original"`). Context chains via `previous_response_id`.
+  - `request_approval` / `request_takeover` are function tools.
+  - `pending_safety_checks` → the user approves first (otherwise stop), then they're sent back as `acknowledged_safety_checks`.
+  - Key names are mapped (CTRL/ENTER/ArrowUp → xdotool keysyms); scroll pixels → wheel clicks (100 px per click).
+  - Raw HTTP via the existing shared httpx client, like the rest of the backend.
+- Tests: OpenAI action mapping, the loop (actions → screenshot output → approval denied → final text), a declined safety check stops before acting, and provider-aware availability. Backend 66 passed / 3 skipped.
+- **Unverified:**
+  - A real OpenAI call. It needs the OpenAI key (on Railway; not available locally).
+  - Whether this account has access to `gpt-6.1-sol`.
+  - Gaps the docs left open: the exact keypress key format, the drag path shape, the wait field, and whether `pending_safety_checks` still exists.
+
+### 2026-10-01 — UI polish to DESIGN.md (Standard lane, desktop)
+- **Tasks:**
+  - Status reflects what the user needs to act on: NEEDS YOU (amber) when an approval is pending, WAITING (gray) when parked; `/tasks` now returns `approval_needed`.
+  - The header shows agent · started · what it's waiting for. Replaced the stale "v1.1 read-only" copy and removed the "polling…" debug label.
+  - New Computer section (live view, Take over, "I'm done — continue"); COMPUTER rows in Activity; the take-over approval reads "I'm done" / "Stop".
+- **Agents:** rebuilt as the two-pane list/detail layout (§4.1). Tool names are in plain language ("Send email", "Use a cloud computer"); permissions are in a grid card; Save / Delete (danger) with a confirm.
+- Tests: `TasksComputer.test.tsx`, updated `AgentsTab.test.tsx`. Jest 25; tsc clean.
+
+### 2026-10-01 — Phase 5: computer use on cloud VMs (Full lane, backend + desktop)
+- User decisions: managed sandbox (E2B Desktop), Claude for computer use only, "ask before risky steps".
+- `computer_use.py`: the `use_computer(goal, start_url?)` tool for background tasks.
+  - A sub-loop drives an E2B Linux desktop (1280×800) with Claude's `computer_toolset_20260801` (model via gateway role `computer_use` = `claude-opus-5-5`, effort medium, server-side refusal fallback `"default"` with retry-without on rejection, top-level prompt caching). API shapes were verified against the docs and the installed SDKs (anthropic 1.11.0, e2b-desktop 2.6.0).
+  - Keys go straight to xdotool (Claude's names are keysyms; E2B's `press` lowercases them). Zoom is disabled (no image library needed).
+  - Batch semantics: stop at the first failure; the rest get "Not executed".
+  - Safety: Claude must call `request_approval` before submit/purchase/send/sign-in/terms/delete/download, and `request_takeover` for logins, captchas, 2FA and payment. Both go through `task_approvals` (notification + Tasks card). Pages are treated as data. Caps: 60 turns and 30 minutes per session; the VM is always killed.
+  - Live view: authenticated noVNC stream, a view-only URL for watching and an interactive URL for take-over.
+  - Resume: the sandbox ID is stored per call, so a resumed task reconnects (`Sandbox.connect`) and a finished session's result is reused instead of re-run.
+  - Offered only when `E2B_API_KEY` and `ANTHROPIC_API_KEY` are set.
+- New dependencies `anthropic==1.11.0` and `e2b-desktop==2.6.0` (clean resolve with the existing pins). New settings `anthropic_api_key` and `e2b_api_key`.
+- Tests: `test_computer_use.py` (action mapping, session loop with approval denied + batch failure + live-view event + VM cleanup, result reuse, hidden without keys). Backend 62 passed / 3 skipped.
+- **Verified live on E2B (2026-10-02, user key, run locally and not stored):** sandbox create 4.0 s; authenticated view-only and control stream URLs; click, `ctrl+l`, typing, Escape, scroll, cursor position and screenshot (1280×800 PNG; Firefox loaded example.com and the text landed in the address bar); kill.
+- **Still unverified:** the Claude side (needs `ANTHROPIC_API_KEY`), task quality, latency/cost per session, and the noVNC iframe inside Electron.
+
+### 2026-10-01 — Expired login handling (Full lane, engine + desktop)
+- Any backend 401 (`/invoke` handlers, `_backend_json`, the task stream relay, the LLM client, STT key fetch) → `config.report_unauthorized()`. It clears the session and broadcasts `auth-expired`. Electron deletes `session.enc` and the app shows sign-in, instead of failing every call ("Signature has expired").
+- Test: `test_report_unauthorized_signs_out_and_notifies`. Engine 53 passed.
+
+### 2026-10-01 — Fix: re-login kept the old (expired) token (engine, found in user testing)
+- Bug in the safeStorage JWT work: signing in again *without* signing out first saved the new token, but the next WebSocket sync restored the old token from `session.enc`. Result: "Invalid token: Signature has expired" on every call.
+- Fix (`config.save_jwt`): a token different from the current one is treated as a new login and put on disk for Electron to adopt.
+- Regression test `test_relogin_while_secured_hands_new_token_to_electron`. Engine 52 passed.
+- **Still open (needs user OK, auth):** the app doesn't notice an expired token at all and stays "signed in". Proposed: clear the session on a 401 and show sign-in.
+
+### 2026-10-01 — Pushed to staging + verified (user-approved one-time push)
+- Committed `ac52891` on `staging` (45 files, staged by explicit path, no `oauth.py`, secret scan clean) and pushed.
+- CI run 36804127787 passed: backend, engine (macOS, Python 3.13, now verified) and desktop.
+- Staging redeployed: `/agents`, `/route` and `/tasks/stream` are live and health is OK. The backend only starts after `init_db` (Alembic `upgrade head`) succeeds, so migrations 0002–0004 ran on real Postgres.
+- CI annotations to handle later: actions/checkout@v4 and setup-python@v5 run on deprecated Node 20, and `ubuntu-latest` moves to Ubuntu 26 on 2026-10-19.
 
 ### 2026-09-30 — Phase 4: desktop context (Full lane, engine + backend + desktop)
 - **Changed approach from the plan:** no Rust helper work. The Mac engine already captured the frontmost app bundle ID, the browser URL and the selected text at hotkey press, but only text transforms used them.

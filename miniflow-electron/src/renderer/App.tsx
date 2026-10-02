@@ -55,7 +55,9 @@ export function App() {
     const offTasksReveal = (window.miniflow as any).onTasksReveal?.(() =>
       setTab("tasks")
     );
-    return () => { offStatus(); offAct(); offReveal?.(); offTasksReveal?.(); };
+    // Session expired on the backend → engine signed out → show sign-in.
+    const offAuth = (window.miniflow as any).onAuthExpired?.(() => setShowOnboarding(true));
+    return () => { offStatus(); offAct(); offReveal?.(); offTasksReveal?.(); offAuth?.(); };
   }, []);
 
   function closeOnboarding() {

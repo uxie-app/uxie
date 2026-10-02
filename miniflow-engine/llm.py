@@ -156,6 +156,8 @@ async def _uxie_chat_stream(
     async with httpx.AsyncClient(timeout=60) as client:
         async with client.stream("POST", f"{base}/llm/stream",
                                  headers=headers, json=payload) as resp:
+            if resp.status_code == 401:
+                _config.report_unauthorized()
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
@@ -199,6 +201,8 @@ async def _uxie_chat(
     base = _config.get_uxie_backend_url()
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(f"{base}/llm/chat", headers=headers, json=payload)
+        if resp.status_code == 401:
+            _config.report_unauthorized()
         resp.raise_for_status()
         data = resp.json()
 

@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import current_user
 from db import SessionLocal, User, get_db
+import computer_use
 import model_gateway
 from events import WAIT_TOOL_SCHEMAS, WAIT_TOOLS, build_wait
 from db_ios import Agent, BackgroundTask, TaskApproval, TaskEvent
@@ -80,7 +81,10 @@ DESTRUCTIVE_TOOLS: set[str] = {
 }
 
 # Union — what the agent loop will accept.
-ALL_ALLOWED_TOOLS: set[str] = READ_ONLY_TOOLS | DESTRUCTIVE_TOOLS | WAIT_TOOLS
+# Cloud-desktop computer use (computer_use.py). It gates its own risky steps.
+COMPUTER_TOOLS: set[str] = {"use_computer"}
+
+ALL_ALLOWED_TOOLS: set[str] = READ_ONLY_TOOLS | DESTRUCTIVE_TOOLS | WAIT_TOOLS | COMPUTER_TOOLS
 
 # Approval window for a parked destructive tool call before auto-cancel.
 APPROVAL_TIMEOUT_S = 300
@@ -210,7 +214,7 @@ def _with_context(prompt: str, ctx: dict | None) -> str:
 def _effective_policy(agent: Agent | None) -> dict[str, str]:
     """tool → allow | require_approval | deny. Built-in defaults (read-only
     allowed, destructive gated) overlaid with the agent's own policy."""
-    policy = {t: "allow" for t in READ_ONLY_TOOLS | WAIT_TOOLS}
+    policy = {t: "allow" for t in READ_ONLY_TOOLS | WAIT_TOOLS | COMPUTER_TOOLS}
     policy.update({t: "require_approval" for t in DESTRUCTIVE_TOOLS})
     if agent is not None and agent.tool_policy:
         policy.update({k: v for k, v in agent.tool_policy.items() if k in policy})
@@ -237,6 +241,59 @@ async def _auto_approve(task_id: str, tool_call_id: str, tool: str) -> None:
             s.add(TaskApproval(task_id=task_id, tool_call_id=tool_call_id, tool=tool,
                                status="approved", decided_at=datetime.now(timezone.utc)))
             await s.commit()
+
+
+async def _event(task_id: str, kind: str, data: dict) -> None:
+    """Append a task event from outside the loop's own session."""
+    async with SessionLocal() as s:
+        await _append_event(s, task_id, kind, data)
+        await s.commit()
+
+
+class _ComputerHooks(computer_use.Hooks):
+    def __init__(self, task_id: str, call_id: str):
+        self.task_id, self.call_id = task_id, call_id
+
+    async def event(self, kind: str, data: dict) -> None:
+        await _event(self.task_id, kind, {**data, "call_id": self.call_id})
+
+    async def ask(self, call_id: str, tool: str, summary: str, timeout_s: float) -> bool:
+        await _event(self.task_id, "approval_needed", {"id": call_id, "name": tool, "args": {}, "summary": summary})
+        decision, _, _ = await _park_for_approval(self.task_id, call_id, tool, timeout_s)
+        await _event(self.task_id, "approval_resolved", {"id": call_id, "name": tool, "approved": decision == "approved"})
+        return decision == "approved"
+
+
+async def _run_computer(task_id: str, call_id: str, args: dict) -> str:
+    """Run (or resume) a computer-use session for one use_computer call.
+    A finished session's result is reused; an unfinished one reconnects to
+    its sandbox."""
+    if not computer_use.available():
+        return "Computer use isn't configured on this server."
+    goal = str(args.get("goal") or "").strip()
+    if not goal:
+        return "use_computer needs a goal."
+    async with SessionLocal() as s:
+        rows = (await s.execute(select(TaskEvent.kind, TaskEvent.data).where(
+            TaskEvent.task_id == task_id, TaskEvent.kind.in_(["computer_session", "computer_result"]),
+        ).order_by(TaskEvent.seq))).all()
+    sandbox_id = None
+    for kind, data in rows:
+        if (data or {}).get("call_id") != call_id:
+            continue
+        if kind == "computer_result":
+            return data.get("result", "")
+        sandbox_id = data.get("sandbox_id")
+    try:
+        result = await computer_use.run_session(
+            goal, hooks=_ComputerHooks(task_id, call_id),
+            start_url=args.get("start_url"), sandbox_id=sandbox_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        _log.exception("computer session failed for task %s", task_id)
+        result = f"The computer session failed: {str(e)[:300]}"
+    await _event(task_id, "computer_result", {"call_id": call_id, "result": result[:8000]})
+    return result
 
 
 async def _mark_executed(task_id: str, tool_call_id: str, result: str) -> None:
@@ -333,6 +390,7 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
             connected_schemas = await _allowed_tool_schemas(db, user_id)
             tool_schemas = [
                 s for s in connected_schemas + WAIT_TOOL_SCHEMAS
+                + ([computer_use.TOOL_SCHEMA] if computer_use.available() else [])
                 if policy.get(s.get("function", {}).get("name")) != "deny"
             ]
 
@@ -484,6 +542,15 @@ async def _run_task_loop(task_id: str, user_id: int, prompt: str) -> None:
                             "tool_call_id": tc_id,
                             "content": f"Tool {name!r} is not available in background tasks.",
                         }
+
+                    if name in COMPUTER_TOOLS:
+                        await _append_event(db, task_id, "tool_call", {"id": tc_id, "name": name, "args": args})
+                        await db.commit()
+                        result_str = await _run_computer(task_id, tc_id, args)
+                        await _append_event(db, task_id, "tool_result", {
+                            "id": tc_id, "name": name, "ok": True, "result_preview": result_str[:1000],
+                        })
+                        return {"tool_call_id": tc_id, "content": result_str}
 
                     if name in WAIT_TOOLS:
                         wait, msg = build_wait(name, args)
@@ -659,6 +726,11 @@ async def tasks_list(
     """Most recent 50 tasks for the caller."""
     import agents as _agents
     names = {a.id: a.name for a in await _agents.user_agents(db, user.id)}
+    pending = set((await db.execute(
+        select(TaskApproval.task_id).join(BackgroundTask, BackgroundTask.id == TaskApproval.task_id).where(
+            BackgroundTask.user_id == user.id, TaskApproval.status == "pending",
+        )
+    )).scalars().all())
     rows = (await db.execute(
         select(BackgroundTask).where(BackgroundTask.user_id == user.id)
         .order_by(desc(BackgroundTask.created_at)).limit(50)
@@ -672,6 +744,7 @@ async def tasks_list(
                 "agent_name": names.get(r.agent_id),
                 "status": r.status,
                 "waiting": r.waiting_for is not None,
+                "approval_needed": r.id in pending,
                 "result_md": r.result_md,
                 "error": r.error,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
